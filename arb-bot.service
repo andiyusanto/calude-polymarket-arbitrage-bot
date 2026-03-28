@@ -1,0 +1,19 @@
+[Unit]
+Description=Polymarket Latency Arbitrage Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace with your Linux username and actual paths:
+User=YOUR_LINUX_USER
+WorkingDirectory=/path/to/your/bot
+EnvironmentFile=/path/to/your/bot/.env
+ExecStart=/usr/bin/python3 polymarket_arb_bot.py --live --confirm-live --i-understand-risks
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/path/to/your/bot/arb_bot.log
+StandardError=append:/path/to/your/bot/arb_bot.log
+
+[Install]
+WantedBy=multi-user.target

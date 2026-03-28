@@ -165,8 +165,112 @@ The live dashboard refreshes twice per second and displays:
 ├── .env.example            # Credential template
 ├── .env                    # Your credentials (never commit this)
 ├── trades.db               # SQLite database (auto-created)
-└── arb_bot.log             # Rolling log file (auto-created)
+├── arb_bot.log             # Rolling log file (auto-created)
+└── arb-bot.service         # systemd service file (optional)
 ```
+
+---
+
+## Keeping the Bot Alive (Process Management)
+
+The bot handles internal failures well — dropped WebSocket connections reconnect automatically, and API errors retry with exponential backoff. But none of that helps if **the process itself dies** because your SSH session closed, your laptop went to sleep, or the server rebooted. Use one of the options below to protect against that.
+
+---
+
+### Option 1 — tmux (simplest, recommended for development)
+
+`tmux` keeps your terminal session alive after you disconnect.
+
+```bash
+# Start a named session
+tmux new -s arb-bot
+
+# Run the bot inside it
+python polymarket_arb_bot.py --live --confirm-live --i-understand-risks
+
+# Detach (bot keeps running): Ctrl+B then D
+
+# Reattach later from any SSH session
+tmux attach -t arb-bot
+
+# List all sessions
+tmux ls
+```
+
+If your server doesn't have tmux: `sudo apt install tmux` (Ubuntu/Debian) or `brew install tmux` (macOS).
+
+---
+
+### Option 2 — nohup (quick one-liner, no reattach)
+
+Redirects output to a file and keeps the process running after logout. You won't be able to see the live dashboard, but logs and the database still work.
+
+```bash
+nohup python polymarket_arb_bot.py --live --confirm-live --i-understand-risks \
+  >> nohup_arb.log 2>&1 &
+
+# Note the printed PID, then check it anytime:
+tail -f nohup_arb.log
+
+# Stop the bot:
+kill <PID>
+```
+
+---
+
+### Option 3 — systemd (recommended for production servers)
+
+systemd auto-restarts the bot on crash and brings it back up after a server reboot. Create the service file at `/etc/systemd/system/arb-bot.service`:
+
+```ini
+[Unit]
+Description=Polymarket Latency Arbitrage Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USER
+WorkingDirectory=/path/to/your/bot
+EnvironmentFile=/path/to/your/bot/.env
+ExecStart=/usr/bin/python3 polymarket_arb_bot.py --live --confirm-live --i-understand-risks
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/path/to/your/bot/arb_bot.log
+StandardError=append:/path/to/your/bot/arb_bot.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable and start it:
+
+```bash
+# Replace placeholders first, then:
+sudo systemctl daemon-reload
+sudo systemctl enable arb-bot
+sudo systemctl start arb-bot
+
+# Check status and live logs
+sudo systemctl status arb-bot
+sudo journalctl -u arb-bot -f
+```
+
+> **Note:** The Rich terminal dashboard won't render under systemd since there's no TTY. The bot still runs fully — trades execute, Telegram alerts fire, and everything logs to `trades.db` and `arb_bot.log` as normal. Remove the `--live` flags if running in paper mode.
+
+---
+
+### Which option to choose?
+
+| | tmux | nohup | systemd |
+|---|---|---|---|
+| Survives SSH disconnect | ✅ | ✅ | ✅ |
+| Survives server reboot | ❌ | ❌ | ✅ |
+| Auto-restarts on crash | ❌ | ❌ | ✅ |
+| Live dashboard works | ✅ | ❌ | ❌ |
+| Setup complexity | Low | Minimal | Medium |
+
+For a VPS running 24/7, use **systemd**. For local development or occasional runs, use **tmux**.
 
 ---
 
