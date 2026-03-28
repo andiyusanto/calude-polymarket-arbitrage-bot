@@ -110,6 +110,7 @@ All thresholds are defined in the `Config` dataclass at the top of `polymarket_a
 | `confidence_threshold` | `85.0` | Minimum confidence score (0–100) to trade |
 | `kelly_fraction` | `0.5` | Kelly multiplier (0.5 = half-Kelly) |
 | `kill_switch_drawdown` | `20.0` | Daily drawdown % that triggers the kill switch |
+| `max_slippage_pct` | `1.5` | Maximum VWAP slippage (%) allowed before rejecting a trade |
 | `order_cooldown_sec` | `1.0` | Minimum seconds between order submissions |
 | `ws_reconnect_delay` | `5.0` | Seconds before reconnecting a dropped WebSocket |
 | `max_retries` | `5` | Retry attempts for failed API calls (exponential backoff) |
@@ -129,6 +130,30 @@ Query recent trades directly:
 ```bash
 sqlite3 trades.db "SELECT * FROM trades ORDER BY opened_at DESC LIMIT 20;"
 ```
+
+---
+
+## Slippage Guard
+
+Before any trade is submitted, the bot walks the live Polymarket order book to estimate the actual fill price for the intended position size. Trades are rejected if the estimated slippage exceeds `max_slippage_pct` (default: 1.5%).
+
+**How it works:**
+
+- For a **YES buy**, the bot consumes ask levels from lowest price upward.
+- For a **NO buy**, it mirrors the bid side (since NO = 1 − YES).
+- It computes the **volume-weighted average price (VWAP)** across all levels needed to fill the order.
+- Slippage is then `(VWAP − best_price) / best_price × 100`.
+- If the full order size can't be filled by available liquidity, the trade is also rejected.
+
+**What gets logged on rejection:**
+
+```
+SLIPPAGE REJECTED BTC UP YES – slippage=3.21% (max 1.50%), fillable=$42.00 of $80.00
+```
+
+This protects against thin markets where posting even a modest order would move the price significantly against you, eroding the edge that triggered the signal in the first place.
+
+To relax or tighten the guard, adjust `max_slippage_pct` in the `Config` dataclass.
 
 ---
 

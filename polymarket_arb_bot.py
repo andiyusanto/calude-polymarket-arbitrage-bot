@@ -71,6 +71,7 @@ class Config:
     confidence_threshold: float = 85.0 # Min confidence score to trade
     kelly_fraction: float = 0.5        # Half-Kelly
     kill_switch_drawdown: float = 20.0 # Daily drawdown % to halt all trading
+    max_slippage_pct: float = 1.5      # Max acceptable VWAP slippage vs best price (%)
 
     # Binance WebSocket
     binance_ws_url: str = "wss://stream.binance.com:9443/stream"
@@ -112,6 +113,9 @@ class MarketSnapshot:
     duration: str       # 5min or 15min
     yes_price: float    # Polymarket YES token price (0-1)
     no_price: float
+    # Raw order book levels: list of (price, size) tuples, asks sorted low→high
+    asks: list[tuple[float, float]] = field(default_factory=list)
+    bids: list[tuple[float, float]] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
 
 
@@ -441,6 +445,11 @@ class PolymarketMonitor:
                 best_ask = float(book.asks[0].price) if book.asks else 0.5
                 best_bid = float(book.bids[0].price) if book.bids else 0.5
                 yes_price = (best_ask + best_bid) / 2
+
+                # Preserve raw levels for slippage analysis
+                asks = [(float(l.price), float(l.size)) for l in book.asks]
+                bids = [(float(l.price), float(l.size)) for l in book.bids]
+
                 return MarketSnapshot(
                     market_id=market_id,
                     asset=meta["asset"],
@@ -448,6 +457,8 @@ class PolymarketMonitor:
                     duration=meta["duration"],
                     yes_price=yes_price,
                     no_price=1.0 - yes_price,
+                    asks=asks,
+                    bids=bids,
                 )
             except Exception as e:
                 backoff = 2 ** attempt
@@ -597,8 +608,78 @@ class KellySizer:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Order executor
+# Slippage guard
 # ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SlippageResult:
+    vwap: float             # Volume-weighted average fill price
+    best_price: float       # Top-of-book price (best ask for buys, best bid for sells)
+    slippage_pct: float     # (vwap - best_price) / best_price * 100
+    fillable_usdc: float    # Total liquidity available up to size requested
+    passes: bool            # True if slippage <= CONFIG.max_slippage_pct
+
+
+class SlippageGuard:
+    """
+    Walks the order book to compute the VWAP fill price for a given USDC
+    size, then rejects the trade if estimated slippage exceeds the threshold.
+
+    For a YES buy we consume asks (lowest price first).
+    For a NO buy we consume bids inverted (highest price first, since
+    NO = 1 - YES, so buying NO is equivalent to selling YES).
+    """
+
+    @staticmethod
+    def check(snap: MarketSnapshot, side: str, size_usdc: float) -> SlippageResult:
+        # Choose the correct side of the book
+        if side == "YES":
+            # Buying YES tokens → walk asks, sorted low→high (already sorted)
+            levels = sorted(snap.asks, key=lambda x: x[0])
+            best_price = levels[0][0] if levels else snap.yes_price
+        else:
+            # Buying NO tokens → walk bids inverted; NO price = 1 - bid
+            levels = [(1.0 - p, s) for p, s in sorted(snap.bids, key=lambda x: -x[0])]
+            best_price = levels[0][0] if levels else snap.no_price
+
+        if not levels or best_price <= 0:
+            # No book data — conservatively reject
+            return SlippageResult(
+                vwap=best_price,
+                best_price=best_price,
+                slippage_pct=999.0,
+                fillable_usdc=0.0,
+                passes=False,
+            )
+
+        remaining = size_usdc
+        total_cost = 0.0
+        total_tokens = 0.0
+
+        for price, token_size in levels:
+            if remaining <= 0:
+                break
+            level_usdc = price * token_size       # cost to fill this entire level
+            fill_usdc = min(remaining, level_usdc)
+            fill_tokens = fill_usdc / price
+            total_cost += fill_usdc
+            total_tokens += fill_tokens
+            remaining -= fill_usdc
+
+        fillable_usdc = size_usdc - remaining
+        vwap = total_cost / total_tokens if total_tokens > 0 else best_price
+        slippage_pct = abs(vwap - best_price) / best_price * 100 if best_price > 0 else 999.0
+        passes = slippage_pct <= CONFIG.max_slippage_pct and remaining == 0
+
+        return SlippageResult(
+            vwap=vwap,
+            best_price=best_price,
+            slippage_pct=slippage_pct,
+            fillable_usdc=fillable_usdc,
+            passes=passes,
+        )
+
+
 
 class OrderExecutor:
     def __init__(self, live: bool = False):
@@ -835,6 +916,18 @@ class ArbBot:
         if size < 1.0:   # minimum $1
             return
 
+        # ── Slippage guard ─────────────────────────────────────────────────
+        slip = SlippageGuard.check(snap, sig.side, size)
+        if not slip.passes:
+            log.info(
+                "SLIPPAGE REJECTED %s %s %s – slippage=%.2f%% (max %.2f%%), "
+                "fillable=$%.2f of $%.2f",
+                sig.asset, sig.direction, sig.side,
+                slip.slippage_pct, CONFIG.max_slippage_pct,
+                slip.fillable_usdc, size,
+            )
+            return
+
         acted = False
         if sig.edge_pct >= CONFIG.min_edge_pct and sig.confidence >= CONFIG.confidence_threshold:
             pos = await self.executor.execute(sig, size)
@@ -847,9 +940,10 @@ class ArbBot:
                 msg = (
                     f"{'🟢' if self.live else '📋'} *{'LIVE' if self.live else 'PAPER'} TRADE*\n"
                     f"Market: {sig.asset} {sig.direction} {sig.duration}\n"
-                    f"Side: {sig.side} @ ${sig.poly_price:.4f}\n"
-                    f"Fair Value: ${sig.fair_value:.4f}  Edge: {sig.edge_pct:.1f}%\n"
-                    f"Confidence: {sig.confidence:.0f}%  Size: ${size:.2f}"
+                    f"Side: {sig.side} @ best={slip.best_price:.4f} VWAP={slip.vwap:.4f}\n"
+                    f"Slippage: {slip.slippage_pct:.2f}%  Edge: {sig.edge_pct:.1f}%\n"
+                    f"Fair Value: {sig.fair_value:.4f}  Confidence: {sig.confidence:.0f}%\n"
+                    f"Size: ${size:.2f}"
                 )
                 await self.notifier.send(msg)
 
