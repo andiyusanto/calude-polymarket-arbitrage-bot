@@ -98,17 +98,21 @@ CONFIG = Config()
 # ═══════════════════════════════════════════════════════════════════════════
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.FileHandler("arb_bot.log"),
         logging.StreamHandler(),
     ],
 )
-# Suppress noisy httpx debug logs, keep our bot logs at DEBUG
-logging.getLogger("httpx").setLevel(logging.INFO)
+# Keep arb_bot at DEBUG for our own messages, suppress noisy libraries
+logging.getLogger("arb_bot").setLevel(logging.DEBUG)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("hpack").setLevel(logging.WARNING)
+logging.getLogger("h2").setLevel(logging.WARNING)
 logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
 log = logging.getLogger("arb_bot")
 
 # ═══════════════════════════════════════════════════════════════════════════
