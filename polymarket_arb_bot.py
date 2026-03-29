@@ -568,21 +568,38 @@ class PolymarketMonitor:
                 limit  = 100
                 while len(found) < 50:   # stop after finding enough or exhausting pages
                     params = {
-                        "active":    "true",
-                        "closed":    "false",
-                        "order":     "end_date",
-                        "ascending": "true",     # soonest-ending first
-                        "limit":     limit,
-                        "offset":    offset,
+                        "archived": "false",
+                        "active":   "true",
+                        "closed":   "false",
+                        "order":    "endDate",    # camelCase per Gamma API
+                        "ascending":"true",
+                        "limit":    limit,
+                        "offset":   offset,
                     }
                     async with session.get(
                         GAMMA_EVENTS_URL, params=params,
                         timeout=aiohttp.ClientTimeout(total=15)
                     ) as resp:
                         if resp.status != 200:
-                            log.error("Gamma events API HTTP %s", resp.status)
-                            break
-                        events = await resp.json(content_type=None)
+                            # Fallback: try without order param which may be causing 422
+                            params2 = {
+                                "archived": "false",
+                                "active":   "true",
+                                "closed":   "false",
+                                "limit":    limit,
+                                "offset":   offset,
+                            }
+                            async with session.get(
+                                GAMMA_EVENTS_URL, params=params2,
+                                timeout=aiohttp.ClientTimeout(total=15)
+                            ) as resp2:
+                                if resp2.status != 200:
+                                    log.error("Gamma events API HTTP %s (fallback also failed %s)",
+                                              resp.status, resp2.status)
+                                    break
+                                events = await resp2.json(content_type=None)
+                        else:
+                            events = await resp.json(content_type=None)
 
                     if not isinstance(events, list):
                         events = events.get("data", events.get("events", []))
@@ -684,9 +701,10 @@ class PolymarketMonitor:
                                 )
 
                     offset += limit
-                    # Stop paginating once end_date passes beyond 20min window
-                    if events:
-                        last_end = events[-1].get("markets", [{}])[-1].get("endDate", "")
+                    # Stop once we've passed the 20-min expiry window
+                    if isinstance(events, list) and events:
+                        last = events[-1]
+                        last_end = last.get("endDate", "") or last.get("end_date", "")
                         if last_end:
                             try:
                                 ts = datetime.fromisoformat(
@@ -696,6 +714,8 @@ class PolymarketMonitor:
                                     break
                             except Exception:
                                 pass
+                    if not events:
+                        break
 
             if found:
                 self.market_ids = found
