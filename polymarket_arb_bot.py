@@ -544,23 +544,32 @@ class PolymarketMonitor:
         params = {
             "closed":     "false",
             "limit":      500,
-            "order":      "volume24hr",
-            "ascending":  "false",
-            "tag_slug":   "crypto",   # filter to crypto markets
+            "order":      "endDate",       # soonest-expiring first = short-duration markets
+            "ascending":  "true",
         }
 
+        # Actual Polymarket 5M question formats seen in the wild:
+        #   "bitcoin up or down - march 29, 5:15am-5:20am et"
+        #   "bitcoin up or down on march 29?"
+        #   "btc up or down - march 29, 4am et"
+        #   "will btc be higher in 5 minutes?"
+        #   "will the price of bitcoin be above $X at Y:00?"
         ASSET_KEYWORDS = {
             "BTC": ["btc", "bitcoin"],
             "ETH": ["eth", "ethereum", "ether"],
         }
-        DIR_KEYWORDS = {
-            "UP":   ["higher", "above", "up", "increase", "rise", "over"],
-            "DOWN": ["lower", "below", "down", "decrease", "fall", "under"],
-        }
-        DUR_KEYWORDS = {
-            "5min":  ["5 min", "5min", "5-min", "5 m", "five min", "next 5", "5 minutes"],
-            "15min": ["15 min", "15min", "15-min", "15 m", "fifteen min", "next 15", "15 minutes"],
-        }
+        # Direction: "up or down" markets need outcome-level detection (not question-level)
+        # so we match question for asset+timeframe, then infer direction from outcome field
+        DUR_PATTERNS = [
+            # explicit minute markers
+            "5min", "5 min", "5-min", "5 minutes",
+            "15min", "15 min", "15-min", "15 minutes",
+            # time-window format: "5:15am-5:20am" (5 min window), "4am-4:15am" (15 min)
+            # we'll detect these by checking outcome or grouping
+            # short time strings like "4am et", "5:15am" suggest 5M markets
+            "am et", "pm et",   # time-of-day suffix = short duration market
+            "up or down",       # Polymarket's canonical phrasing for these markets
+        ]
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -583,37 +592,70 @@ class PolymarketMonitor:
 
                 log.debug("GAMMA QUESTION: %s", question)
 
-                for asset, asset_kws in ASSET_KEYWORDS.items():
-                    if not any(k in question for k in asset_kws):
-                        continue
-                    for direction, dir_kws in DIR_KEYWORDS.items():
-                        if not any(k in question for k in dir_kws):
-                            continue
-                        for duration, dur_kws in DUR_KEYWORDS.items():
-                            if not any(k in question for k in dur_kws):
-                                continue
+                # Must mention BTC or ETH
+                asset = None
+                for a, kws in ASSET_KEYWORDS.items():
+                    if any(k in question for k in kws):
+                        asset = a
+                        break
+                if not asset:
+                    continue
 
-                            # Gamma API embeds clobTokenIds or conditionId
-                            clob_token_ids = m.get("clobTokenIds") or []
-                            if isinstance(clob_token_ids, str):
-                                import json as _json
-                                try:
-                                    clob_token_ids = _json.loads(clob_token_ids)
-                                except Exception:
-                                    clob_token_ids = []
+                # Must be a short-duration market
+                if not any(p in question for p in DUR_PATTERNS):
+                    continue
 
-                            # First token = YES, second = NO
-                            if clob_token_ids:
-                                token_id = clob_token_ids[0]  # YES token
-                                found[token_id] = {
-                                    "asset":     asset,
-                                    "direction": direction,
-                                    "duration":  duration,
-                                }
-                                log.info(
-                                    "Discovered: %s → %s %s %s  (q: %.70s)",
-                                    str(token_id)[:16], asset, direction, duration, question
-                                )
+                # Determine duration from question text
+                if any(p in question for p in ["15min", "15 min", "15-min", "15 minutes"]):
+                    duration = "15min"
+                else:
+                    # Default short-duration to 5min
+                    # (time-window format like "5:15am-5:20am" = 5 min gap)
+                    duration = "5min"
+
+                clob_token_ids = m.get("clobTokenIds") or []
+                if isinstance(clob_token_ids, str):
+                    import json as _json
+                    try:
+                        clob_token_ids = _json.loads(clob_token_ids)
+                    except Exception:
+                        clob_token_ids = []
+
+                outcomes = m.get("outcomes")
+                if isinstance(outcomes, str):
+                    import json as _json
+                    try:
+                        outcomes = _json.loads(outcomes)
+                    except Exception:
+                        outcomes = []
+                outcomes = outcomes or []
+
+                # Map each token to its outcome (UP/DOWN)
+                for i, token_id in enumerate(clob_token_ids):
+                    if i >= len(outcomes):
+                        break
+                    outcome = str(outcomes[i]).lower()
+
+                    # Infer direction from outcome label
+                    if any(k in outcome for k in ["up", "higher", "yes", "above", "over"]):
+                        direction = "UP"
+                    elif any(k in outcome for k in ["down", "lower", "no", "below", "under"]):
+                        direction = "DOWN"
+                    else:
+                        # For binary "Yes/No" markets, token 0 = YES = UP
+                        direction = "UP" if i == 0 else "DOWN"
+
+                    found[token_id] = {
+                        "asset":     asset,
+                        "direction": direction,
+                        "duration":  duration,
+                    }
+                    log.info(
+                        "Discovered: %s → %s %s %s  outcome=%s  (q: %.60s)",
+                        str(token_id)[:16], asset, direction, duration,
+                        outcomes[i] if i < len(outcomes) else "?",
+                        question,
+                    )
 
             if found:
                 self.market_ids = found
