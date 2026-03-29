@@ -98,13 +98,17 @@ CONFIG = Config()
 # ═══════════════════════════════════════════════════════════════════════════
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.FileHandler("arb_bot.log"),
         logging.StreamHandler(),
     ],
 )
+# Suppress noisy httpx debug logs, keep our bot logs at DEBUG
+logging.getLogger("httpx").setLevel(logging.INFO)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("websockets").setLevel(logging.WARNING)
 log = logging.getLogger("arb_bot")
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -531,40 +535,93 @@ class PolymarketMonitor:
         log.info("Discovering active Polymarket markets…")
         try:
             client = self._get_client()
-            loop = asyncio.get_event_loop()
-            # get_markets returns paginated results; fetch first page
-            resp = await loop.run_in_executor(None, lambda: client.get_markets())
-            markets = resp.data if hasattr(resp, "data") else (resp if isinstance(resp, list) else [])
+            loop   = asyncio.get_event_loop()
+
+            # ── Paginate through ALL markets ────────────────────────────────
+            all_markets = []
+            cursor = "MA=="
+            while True:
+                resp = await loop.run_in_executor(
+                    None, lambda c=cursor: client.get_markets(next_cursor=c)
+                )
+                page = resp.data if hasattr(resp, "data") else (resp if isinstance(resp, list) else [])
+                if not page:
+                    break
+                all_markets.extend(page)
+                next_cursor = getattr(resp, "next_cursor", None)
+                if not next_cursor or next_cursor == cursor:
+                    break
+                cursor = next_cursor
+
+            log.info("CLOB returned %d total markets", len(all_markets))
+
+            # ── Debug: log all question strings so we can see exact wording ─
+            for m in all_markets:
+                q = (getattr(m, "question", "") or "").strip()
+                if q:
+                    log.debug("MARKET QUESTION: %s", q)
+
+            # ── Broad keyword matching ──────────────────────────────────────
+            # Polymarket 5M/15M markets use varied phrasing, e.g.:
+            #   "Will BTC be above X at Y:00?"
+            #   "Bitcoin price higher in 5 minutes?"
+            #   "Will the price of BTC increase in the next 5 minutes?"
+            ASSET_KEYWORDS = {
+                "BTC": ["btc", "bitcoin"],
+                "ETH": ["eth", "ethereum", "ether"],
+            }
+            DIR_KEYWORDS = {
+                "UP":   ["higher", "above", "up", "increase", "rise", "bull"],
+                "DOWN": ["lower", "below", "down", "decrease", "fall", "bear"],
+            }
+            DUR_KEYWORDS = {
+                "5min":  ["5 min", "5min", "5-min", "5m ", "five min", "next 5"],
+                "15min": ["15 min", "15min", "15-min", "15m ", "fifteen min", "next 15"],
+            }
 
             found: dict[str, dict] = {}
-            for m in markets:
+            for m in all_markets:
                 question = (getattr(m, "question", "") or "").lower()
-                tokens = getattr(m, "tokens", []) or []
-                for token in tokens:
-                    token_id = getattr(token, "token_id", None)
-                    outcome = (getattr(token, "outcome", "") or "").lower()
-                    if not token_id:
+                tokens   = getattr(m, "tokens", []) or []
+
+                for asset, asset_kws in ASSET_KEYWORDS.items():
+                    if not any(k in question for k in asset_kws):
                         continue
-                    for asset, direction, duration, keywords in self.SEARCH_TERMS:
-                        asset_kw = keywords[:2]   # e.g. ["btc", "bitcoin"]
-                        dir_kw   = keywords[2]     # e.g. "higher"
-                        dur_kws  = keywords[3:]    # e.g. ["5 min", "5min"]
-                        if (any(k in question for k in asset_kw) and
-                                dir_kw in question and
-                                any(k in question for k in dur_kws) and
-                                "yes" in outcome):
-                            found[token_id] = {"asset": asset, "direction": direction, "duration": duration}
-                            log.info("Discovered market: %s → %s %s %s", token_id[:16], asset, direction, duration)
+                    for direction, dir_kws in DIR_KEYWORDS.items():
+                        if not any(k in question for k in dir_kws):
+                            continue
+                        for duration, dur_kws in DUR_KEYWORDS.items():
+                            if not any(k in question for k in dur_kws):
+                                continue
+                            # Match found — grab the YES token
+                            for token in tokens:
+                                token_id = getattr(token, "token_id", None)
+                                outcome  = (getattr(token, "outcome", "") or "").lower()
+                                if token_id and "yes" in outcome:
+                                    found[token_id] = {
+                                        "asset":     asset,
+                                        "direction": direction,
+                                        "duration":  duration,
+                                    }
+                                    log.info(
+                                        "Discovered: %s → %s %s %s  (q: %.60s…)",
+                                        token_id[:16], asset, direction, duration, question
+                                    )
 
             if found:
                 self.market_ids = found
-                log.info("Discovered %d markets", len(found))
+                log.info("Discovered %d tradeable markets", len(found))
             else:
-                log.warning("No markets matched search terms — check Polymarket for active BTC/ETH up/down markets")
+                # Last resort: log ALL questions at WARNING level so user can see them
+                log.warning("No markets matched. All questions seen:")
+                for m in all_markets:
+                    q = (getattr(m, "question", "") or "").strip()
+                    if q:
+                        log.warning("  QUESTION: %s", q)
                 self.market_ids = self.FALLBACK_MARKET_IDS
 
         except Exception as e:
-            log.error("Market discovery failed: %s — using fallback IDs", e)
+            log.error("Market discovery failed: %s", e, exc_info=True)
             self.market_ids = self.FALLBACK_MARKET_IDS
 
     def on_snapshot(self, cb):
