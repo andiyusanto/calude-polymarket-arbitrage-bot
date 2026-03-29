@@ -401,8 +401,13 @@ class TelegramNotifier:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class BinancePriceFeed:
-    # ticker for price + depth for order flow imbalance
-    STREAMS = "btcusdt@ticker/ethusdt@ticker/btcusdt@depth20@100ms/ethusdt@depth20@100ms"
+    # bookTicker fires instantly on any best bid/ask change — much faster than @ticker
+    # depth20@100ms for OFI, ticker as fallback price source
+    STREAMS = (
+        "btcusdt@bookTicker/ethusdt@bookTicker"
+        "/btcusdt@depth20@100ms/ethusdt@depth20@100ms"
+        "/btcusdt@ticker/ethusdt@ticker"
+    )
 
     def __init__(self):
         self.prices: dict[str, float] = {"BTC": 0.0, "ETH": 0.0}
@@ -459,8 +464,17 @@ class BinancePriceFeed:
                                 self._parse_depth(asset, data)
                                 continue
 
-                            # Ticker stream → update price
-                            new_price = float(data.get("c", 0))
+                            # bookTicker stream → instant best bid/ask, compute mid
+                            if "bookticker" in stream or "@bookTicker" in stream.lower():
+                                best_bid = float(data.get("b", 0) or data.get("B", 0))
+                                best_ask = float(data.get("a", 0) or data.get("A", 0))
+                                if best_bid > 0 and best_ask > 0:
+                                    new_price = (best_bid + best_ask) / 2
+                                else:
+                                    continue
+                            else:
+                                # Ticker stream → last trade price
+                                new_price = float(data.get("c", 0))
                             if new_price <= 0:
                                 continue
                             snap = PriceSnapshot(
@@ -519,6 +533,8 @@ class PolymarketMonitor:
         self.market_ids: dict[str, dict] = {}   # populated by _discover_markets
         self._callbacks: list = []
         self._running = False
+        # Executor for sync CLOB calls — bounded to avoid thread explosion
+        self._executor = __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor(max_workers=6)
 
     def _get_client(self) -> ClobClient:
         if self._client is None:
@@ -748,12 +764,10 @@ class PolymarketMonitor:
         for attempt in range(CONFIG.max_retries):
             try:
                 client = self._get_client()
-                loop = asyncio.get_event_loop()
-                # py-clob-client is synchronous; run in executor
-                # Small jitter per attempt to avoid thundering herd on CLOB
-                await asyncio.sleep(attempt * 0.2)
+                loop = asyncio.get_running_loop()
+                await asyncio.sleep(attempt * 0.1)  # reduced jitter
                 book = await loop.run_in_executor(
-                    None, lambda mid=market_id: client.get_order_book(mid)
+                    self._executor, lambda mid=market_id: client.get_order_book(mid)
                 )
                 best_ask = float(book.asks[0].price) if book.asks else 0.5
                 best_bid = float(book.bids[0].price) if book.bids else 0.5
@@ -786,7 +800,7 @@ class PolymarketMonitor:
                 await asyncio.sleep(backoff)
         return None
 
-    async def run(self, poll_interval: float = 2.0):
+    async def run(self, poll_interval: float = 0.5):
         self._running = True
         await self._discover_markets()
         last_discovery = time.time()
@@ -805,20 +819,26 @@ class PolymarketMonitor:
                 last_discovery = time.time()
                 continue
 
-            # Stagger requests: fetch markets sequentially with small delay
-            # to avoid rate-limiting on CLOB (observed HTTP 400 on concurrent hits)
+            # Fetch in small concurrent batches of 3 to balance speed vs rate limiting
             active_ids = {
                 mid: meta for mid, meta in self.market_ids.items()
                 if not meta.get("end_ts") or meta["end_ts"] > time.time() + 30
             }
 
-            for mid, meta in active_ids.items():
-                snap = await self._fetch_market(mid, meta)
-                if snap:
-                    self.snapshots[snap.market_id] = snap
-                    for cb in self._callbacks:
-                        asyncio.create_task(cb(snap))
-                await asyncio.sleep(0.15)  # 150ms between CLOB requests
+            items = list(active_ids.items())
+            BATCH_SIZE = 3
+            for i in range(0, len(items), BATCH_SIZE):
+                batch = items[i:i + BATCH_SIZE]
+                results = await asyncio.gather(
+                    *[self._fetch_market(mid, meta) for mid, meta in batch],
+                    return_exceptions=True
+                )
+                for snap in results:
+                    if isinstance(snap, MarketSnapshot):
+                        self.snapshots[snap.market_id] = snap
+                        for cb in self._callbacks:
+                            asyncio.create_task(cb(snap))
+                await asyncio.sleep(0.05)  # 50ms between batches
 
             await asyncio.sleep(poll_interval)
 
@@ -872,7 +892,7 @@ class SignalEngine:
         current = self.feed.prices.get(asset, 0)
         ofi = self.feed.ofi.get(asset, 0.5)
 
-        if current == 0 or len(hist) < 30:
+        if current == 0 or len(hist) < 10:
             return 0.5, 0.0
 
         # ── Multi-timeframe momentum ────────────────────────────────────────
@@ -1149,7 +1169,7 @@ class OrderExecutor:
         for attempt in range(CONFIG.max_retries):
             try:
                 client  = self._get_client()
-                loop    = asyncio.get_event_loop()
+                loop    = asyncio.get_running_loop()
                 order_args = OrderArgs(
                     token_id=sig.market_id,
                     price=limit_price,
