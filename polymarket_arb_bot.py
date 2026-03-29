@@ -532,44 +532,184 @@ class PolymarketMonitor:
 
     async def _discover_markets(self):
         """
-        Fetch active markets from Polymarket's Gamma API (which powers the
-        frontend) and extract token IDs for BTC/ETH up/down short-duration markets.
-        The CLOB /markets endpoint only lists markets with active order books and
-        returns 0 results when queried unauthenticated — Gamma API is the correct
-        source for market discovery.
+        Discover active BTC/ETH short-duration markets using the Gamma API
+        events endpoint as recommended by Polymarket docs:
+          GET /events?active=true&closed=false&order=end_date&ascending=true
+
+        Only includes markets where:
+          - enableOrderBook is true (CLOB tradeable)
+          - endDate is in the future with at least 60s remaining
+          - question matches BTC/ETH + up-or-down short-duration pattern
         """
-        log.info("Discovering active Polymarket markets via Gamma API…")
-        GAMMA_URL = "https://gamma-api.polymarket.com/markets"
+        log.info("Discovering active Polymarket markets via Gamma events API…")
+        GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 
-        params = {
-            "closed":     "false",
-            "limit":      500,
-            "order":      "endDate",       # soonest-expiring first = short-duration markets
-            "ascending":  "true",
-        }
+        now = time.time()
 
-        # Actual Polymarket 5M question formats seen in the wild:
-        #   "bitcoin up or down - march 29, 5:15am-5:20am et"
-        #   "bitcoin up or down on march 29?"
-        #   "btc up or down - march 29, 4am et"
-        #   "will btc be higher in 5 minutes?"
-        #   "will the price of bitcoin be above $X at Y:00?"
         ASSET_KEYWORDS = {
             "BTC": ["btc", "bitcoin"],
             "ETH": ["eth", "ethereum", "ether"],
         }
-        # Direction: "up or down" markets need outcome-level detection (not question-level)
-        # so we match question for asset+timeframe, then infer direction from outcome field
-        DUR_PATTERNS = [
-            # explicit minute markers
-            "5min", "5 min", "5-min", "5 minutes",
-            "15min", "15 min", "15-min", "15 minutes",
-            # time-window format: "5:15am-5:20am" (5 min window), "4am-4:15am" (15 min)
-            # we'll detect these by checking outcome or grouping
-            # short time strings like "4am et", "5:15am" suggest 5M markets
-            "am et", "pm et",   # time-of-day suffix = short duration market
-            "up or down",       # Polymarket's canonical phrasing for these markets
+        # Polymarket 5M/15M canonical patterns seen in production:
+        #   "bitcoin up or down - march 29, 5:15am-5:20am et"
+        #   "bitcoin up or down on march 29?"
+        #   "btc up or down - march 29, 4am et"
+        SHORT_DUR_SIGNALS = [
+            "up or down", "am et", "pm et",
+            "5 min", "5min", "15 min", "15min",
+            "5 minutes", "15 minutes",
         ]
+
+        found: dict[str, dict] = {}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                offset = 0
+                limit  = 100
+                while len(found) < 50:   # stop after finding enough or exhausting pages
+                    params = {
+                        "active":    "true",
+                        "closed":    "false",
+                        "order":     "end_date",
+                        "ascending": "true",     # soonest-ending first
+                        "limit":     limit,
+                        "offset":    offset,
+                    }
+                    async with session.get(
+                        GAMMA_EVENTS_URL, params=params,
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as resp:
+                        if resp.status != 200:
+                            log.error("Gamma events API HTTP %s", resp.status)
+                            break
+                        events = await resp.json(content_type=None)
+
+                    if not isinstance(events, list):
+                        events = events.get("data", events.get("events", []))
+
+                    if not events:
+                        break   # no more pages
+
+                    for event in events:
+                        # Each event contains a list of markets
+                        markets = event.get("markets") or []
+                        for m in markets:
+                            # ── CLOB order book must be enabled ────────────
+                            if not m.get("enableOrderBook", False):
+                                continue
+
+                            # ── Must not be closed/resolved ────────────────
+                            if m.get("closed") or m.get("resolved"):
+                                continue
+
+                            # ── endDate must be at least 60s in the future ─
+                            end_date_str = m.get("endDate") or m.get("end_date") or ""
+                            if end_date_str:
+                                try:
+                                    from datetime import timezone
+                                    end_dt = datetime.fromisoformat(
+                                        end_date_str.replace("Z", "+00:00")
+                                    )
+                                    end_ts = end_dt.timestamp()
+                                    if end_ts < now + 60:
+                                        continue   # expires too soon
+                                    # Also cap at 20 minutes — beyond that it's not a 5M/15M
+                                    if end_ts > now + 1200:
+                                        continue
+                                except Exception:
+                                    pass
+
+                            question = (m.get("question") or "").lower().strip()
+                            if not question:
+                                continue
+
+                            log.debug("CANDIDATE: %s", question)
+
+                            # ── Asset match ────────────────────────────────
+                            asset = None
+                            for a, kws in ASSET_KEYWORDS.items():
+                                if any(k in question for k in kws):
+                                    asset = a
+                                    break
+                            if not asset:
+                                continue
+
+                            # ── Short-duration signal ──────────────────────
+                            if not any(p in question for p in SHORT_DUR_SIGNALS):
+                                continue
+
+                            # ── Duration classification ────────────────────
+                            if any(p in question for p in ["15 min", "15min", "15 minutes"]):
+                                duration = "15min"
+                            else:
+                                duration = "5min"
+
+                            # ── Extract token IDs ──────────────────────────
+                            clob_token_ids = m.get("clobTokenIds") or []
+                            if isinstance(clob_token_ids, str):
+                                import json as _json
+                                try:
+                                    clob_token_ids = _json.loads(clob_token_ids)
+                                except Exception:
+                                    clob_token_ids = []
+
+                            outcomes = m.get("outcomes") or []
+                            if isinstance(outcomes, str):
+                                import json as _json
+                                try:
+                                    outcomes = _json.loads(outcomes)
+                                except Exception:
+                                    outcomes = []
+
+                            for i, token_id in enumerate(clob_token_ids):
+                                outcome = str(outcomes[i]).lower() if i < len(outcomes) else ""
+                                if any(k in outcome for k in ["up", "higher", "yes", "above"]):
+                                    direction = "UP"
+                                elif any(k in outcome for k in ["down", "lower", "no", "below"]):
+                                    direction = "DOWN"
+                                else:
+                                    direction = "UP" if i == 0 else "DOWN"
+
+                                found[str(token_id)] = {
+                                    "asset":     asset,
+                                    "direction": direction,
+                                    "duration":  duration,
+                                    "end_ts":    end_ts if end_date_str else now + 300,
+                                }
+                                log.info(
+                                    "Discovered: %s → %s %s %s  outcome=%s  (q: %.55s)",
+                                    str(token_id)[:14], asset, direction, duration,
+                                    outcomes[i] if i < len(outcomes) else "?",
+                                    question,
+                                )
+
+                    offset += limit
+                    # Stop paginating once end_date passes beyond 20min window
+                    if events:
+                        last_end = events[-1].get("markets", [{}])[-1].get("endDate", "")
+                        if last_end:
+                            try:
+                                ts = datetime.fromisoformat(
+                                    last_end.replace("Z", "+00:00")
+                                ).timestamp()
+                                if ts > now + 1200:
+                                    break
+                            except Exception:
+                                pass
+
+            if found:
+                self.market_ids = found
+                log.info("Discovered %d tradeable short-duration markets", len(found))
+            else:
+                log.warning(
+                    "No active BTC/ETH short-duration markets found with order books. "
+                    "Check https://polymarket.com/crypto/5M for currently active markets."
+                )
+                self.market_ids = self.FALLBACK_MARKET_IDS
+
+        except Exception as e:
+            log.error("Market discovery failed: %s", e, exc_info=True)
+            self.market_ids = self.FALLBACK_MARKET_IDS
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -584,112 +724,30 @@ class PolymarketMonitor:
             markets = raw if isinstance(raw, list) else raw.get("markets", raw.get("data", []))
             log.info("Gamma API returned %d markets", len(markets))
 
-            found: dict[str, dict] = {}
-            for m in markets:
-                question = (m.get("question") or m.get("title") or "").lower().strip()
-                if not question:
-                    continue
-
-                log.debug("GAMMA QUESTION: %s", question)
-
-                # Must mention BTC or ETH
-                asset = None
-                for a, kws in ASSET_KEYWORDS.items():
-                    if any(k in question for k in kws):
-                        asset = a
-                        break
-                if not asset:
-                    continue
-
-                # Must be a short-duration market
-                if not any(p in question for p in DUR_PATTERNS):
-                    continue
-
-                # Determine duration from question text
-                if any(p in question for p in ["15min", "15 min", "15-min", "15 minutes"]):
-                    duration = "15min"
-                else:
-                    # Default short-duration to 5min
-                    # (time-window format like "5:15am-5:20am" = 5 min gap)
-                    duration = "5min"
-
-                clob_token_ids = m.get("clobTokenIds") or []
-                if isinstance(clob_token_ids, str):
-                    import json as _json
-                    try:
-                        clob_token_ids = _json.loads(clob_token_ids)
-                    except Exception:
-                        clob_token_ids = []
-
-                outcomes = m.get("outcomes")
-                if isinstance(outcomes, str):
-                    import json as _json
-                    try:
-                        outcomes = _json.loads(outcomes)
-                    except Exception:
-                        outcomes = []
-                outcomes = outcomes or []
-
-                # Map each token to its outcome (UP/DOWN)
-                for i, token_id in enumerate(clob_token_ids):
-                    if i >= len(outcomes):
-                        break
-                    outcome = str(outcomes[i]).lower()
-
-                    # Infer direction from outcome label
-                    if any(k in outcome for k in ["up", "higher", "yes", "above", "over"]):
-                        direction = "UP"
-                    elif any(k in outcome for k in ["down", "lower", "no", "below", "under"]):
-                        direction = "DOWN"
-                    else:
-                        # For binary "Yes/No" markets, token 0 = YES = UP
-                        direction = "UP" if i == 0 else "DOWN"
-
-                    found[token_id] = {
-                        "asset":     asset,
-                        "direction": direction,
-                        "duration":  duration,
-                    }
-                    log.info(
-                        "Discovered: %s → %s %s %s  outcome=%s  (q: %.60s)",
-                        str(token_id)[:16], asset, direction, duration,
-                        outcomes[i] if i < len(outcomes) else "?",
-                        question,
-                    )
-
-            if found:
-                self.market_ids = found
-                log.info("Discovered %d tradeable markets", len(found))
-            else:
-                log.warning("No BTC/ETH up/down markets found. Sample questions:")
-                for m in markets[:20]:
-                    q = (m.get("question") or m.get("title") or "").strip()
-                    if q:
-                        log.warning("  GAMMA: %s", q)
-                self.market_ids = self.FALLBACK_MARKET_IDS
-
-        except Exception as e:
-            log.error("Market discovery failed: %s", e, exc_info=True)
-            self.market_ids = self.FALLBACK_MARKET_IDS
-
     def on_snapshot(self, cb):
         self._callbacks.append(cb)
 
     async def _fetch_market(self, market_id: str, meta: dict) -> Optional[MarketSnapshot]:
+        # Skip tokens that have already expired
+        end_ts = meta.get("end_ts", 0)
+        if end_ts and time.time() > end_ts:
+            log.debug("Skipping expired token %s", market_id[:14])
+            return None
+
         for attempt in range(CONFIG.max_retries):
             try:
                 client = self._get_client()
                 loop = asyncio.get_event_loop()
                 # py-clob-client is synchronous; run in executor
+                # Small jitter per attempt to avoid thundering herd on CLOB
+                await asyncio.sleep(attempt * 0.2)
                 book = await loop.run_in_executor(
-                    None, lambda: client.get_order_book(market_id)
+                    None, lambda mid=market_id: client.get_order_book(mid)
                 )
-                # Best ask = cheapest YES token offer
                 best_ask = float(book.asks[0].price) if book.asks else 0.5
                 best_bid = float(book.bids[0].price) if book.bids else 0.5
                 yes_price = (best_ask + best_bid) / 2
 
-                # Preserve raw levels for slippage analysis
                 asks = [(float(l.price), float(l.size)) for l in book.asks]
                 bids = [(float(l.price), float(l.size)) for l in book.bids]
 
@@ -704,31 +762,53 @@ class PolymarketMonitor:
                     bids=bids,
                 )
             except Exception as e:
+                # 400 = token expired/invalid — don't retry
+                err_str = str(e)
+                if "400" in err_str or "status_code=400" in err_str:
+                    log.debug("Token %s returned 400 (likely expired), dropping", market_id[:14])
+                    # Mark as expired so we skip it next cycle
+                    meta["end_ts"] = 0
+                    return None
                 backoff = 2 ** attempt
                 log.warning("Polymarket fetch failed for %s (attempt %d): %s – retry in %ds",
-                            market_id, attempt + 1, e, backoff)
+                            market_id[:14], attempt + 1, e, backoff)
                 await asyncio.sleep(backoff)
         return None
 
     async def run(self, poll_interval: float = 2.0):
         self._running = True
         await self._discover_markets()
+        last_discovery = time.time()
+        REDISCOVER_INTERVAL = 180  # re-discover every 3 minutes (5M markets rotate)
+
         while self._running:
+            # Re-discover periodically since 5M markets expire and new ones open
+            if time.time() - last_discovery > REDISCOVER_INTERVAL:
+                await self._discover_markets()
+                last_discovery = time.time()
+
             if not self.market_ids:
                 log.warning("No market IDs — retrying discovery in 30s")
                 await asyncio.sleep(30)
                 await self._discover_markets()
+                last_discovery = time.time()
                 continue
-            tasks = [
-                self._fetch_market(mid, meta)
-                for mid, meta in self.market_ids.items()
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for snap in results:
-                if isinstance(snap, MarketSnapshot):
+
+            # Stagger requests: fetch markets sequentially with small delay
+            # to avoid rate-limiting on CLOB (observed HTTP 400 on concurrent hits)
+            active_ids = {
+                mid: meta for mid, meta in self.market_ids.items()
+                if not meta.get("end_ts") or meta["end_ts"] > time.time() + 30
+            }
+
+            for mid, meta in active_ids.items():
+                snap = await self._fetch_market(mid, meta)
+                if snap:
                     self.snapshots[snap.market_id] = snap
                     for cb in self._callbacks:
                         asyncio.create_task(cb(snap))
+                await asyncio.sleep(0.15)  # 150ms between CLOB requests
+
             await asyncio.sleep(poll_interval)
 
     def stop(self):
