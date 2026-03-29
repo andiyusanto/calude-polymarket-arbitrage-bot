@@ -39,10 +39,15 @@ from rich.text import Text
 # ── Polymarket CLOB client ──────────────────────────────────────────────────
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType, Side
+    from py_clob_client.clob_types import OrderArgs, OrderType
+except ImportError as e:
+    raise SystemExit(f"py_clob_client import failed: {e}\n  pip install py-clob-client")
+
+# POLYGON chain ID
+try:
     from py_clob_client.constants import POLYGON
 except ImportError:
-    raise SystemExit("Install py-clob-client:  pip install py-clob-client")
+    POLYGON = 137  # Polygon Mainnet chain ID
 
 load_dotenv()
 console = Console()
@@ -733,7 +738,7 @@ class OrderExecutor:
                     token_id=sig.market_id,
                     price=sig.poly_price,
                     size=size_usdc,
-                    side=Side.BUY,
+                    side="BUY",
                 )
                 resp = await loop.run_in_executor(
                     None,
