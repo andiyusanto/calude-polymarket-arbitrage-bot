@@ -78,8 +78,9 @@ class Config:
     kill_switch_drawdown: float = 20.0 # Daily drawdown % to halt all trading
     max_slippage_pct: float = 1.5      # Max acceptable VWAP slippage vs best price (%)
 
-    # Binance WebSocket
-    binance_ws_url: str = "wss://stream.binance.com:9443/stream"
+    # Binance WebSocket — use stream.binance.us if your server gets HTTP 451
+    binance_ws_url: str = "wss://stream.binance.us:9443/stream"
+    binance_ws_fallback: str = "wss://data-stream.binance.com/stream"
 
     # SQLite
     db_path: str = "trades.db"
@@ -348,12 +349,17 @@ class BinancePriceFeed:
         self._callbacks.append(cb)
 
     async def run(self):
-        url = f"{CONFIG.binance_ws_url}?streams={self.STREAMS}"
         self._running = True
+        urls = [
+            f"{CONFIG.binance_ws_url}?streams={self.STREAMS}",
+            f"{CONFIG.binance_ws_fallback}?streams={self.STREAMS}",
+        ]
+        url_index = 0
         while self._running:
+            url = urls[url_index % len(urls)]
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-                    log.info("Binance WebSocket connected")
+                    log.info("Binance WebSocket connected: %s", url)
                     async for raw in ws:
                         try:
                             msg = json.loads(raw)
@@ -382,8 +388,9 @@ class BinancePriceFeed:
             except (websockets.exceptions.ConnectionClosed,
                     websockets.exceptions.WebSocketException,
                     OSError) as e:
-                log.warning("Binance WS disconnected: %s – reconnecting in %ds",
-                            e, CONFIG.ws_reconnect_delay)
+                log.warning("Binance WS disconnected (%s): %s – trying next endpoint in %ds",
+                            url, e, CONFIG.ws_reconnect_delay)
+                url_index += 1
                 await asyncio.sleep(CONFIG.ws_reconnect_delay)
 
     def stop(self):
@@ -397,26 +404,30 @@ class BinancePriceFeed:
 class PolymarketMonitor:
     """
     Polls Polymarket CLOB for BTC/ETH 5-min and 15-min up/down markets.
-    In production replace market_ids with actual Polymarket condition IDs.
+    Market IDs are discovered automatically from the CLOB markets endpoint,
+    filtering by keyword. If none are found, falls back to FALLBACK_MARKET_IDS.
     """
 
-    MARKET_IDS: dict[str, dict] = {
-        # market_id -> meta
-        # Fill these in from https://clob.polymarket.com/markets
-        # Example placeholders – replace with live IDs:
-        "btc-5min-up":   {"asset": "BTC", "direction": "UP",   "duration": "5min"},
-        "btc-5min-down": {"asset": "BTC", "direction": "DOWN", "duration": "5min"},
-        "btc-15min-up":  {"asset": "BTC", "direction": "UP",   "duration": "15min"},
-        "btc-15min-down":{"asset": "BTC", "direction": "DOWN", "duration": "15min"},
-        "eth-5min-up":   {"asset": "ETH", "direction": "UP",   "duration": "5min"},
-        "eth-5min-down": {"asset": "ETH", "direction": "DOWN", "duration": "5min"},
-        "eth-15min-up":  {"asset": "ETH", "direction": "UP",   "duration": "15min"},
-        "eth-15min-down":{"asset": "ETH", "direction": "DOWN", "duration": "15min"},
-    }
+    # Fallback hardcoded IDs — replace these with real condition IDs from
+    # https://clob.polymarket.com/markets if auto-discovery fails.
+    FALLBACK_MARKET_IDS: dict[str, dict] = {}
+
+    # Keywords used to match active markets from the CLOB
+    SEARCH_TERMS = [
+        ("BTC", "UP",   "5min",  ["btc", "bitcoin", "higher", "5 min", "5min"]),
+        ("BTC", "DOWN", "5min",  ["btc", "bitcoin", "lower",  "5 min", "5min"]),
+        ("BTC", "UP",   "15min", ["btc", "bitcoin", "higher", "15 min", "15min"]),
+        ("BTC", "DOWN", "15min", ["btc", "bitcoin", "lower",  "15 min", "15min"]),
+        ("ETH", "UP",   "5min",  ["eth", "ether",   "higher", "5 min", "5min"]),
+        ("ETH", "DOWN", "5min",  ["eth", "ether",   "lower",  "5 min", "5min"]),
+        ("ETH", "UP",   "15min", ["eth", "ether",   "higher", "15 min", "15min"]),
+        ("ETH", "DOWN", "15min", ["eth", "ether",   "lower",  "15 min", "15min"]),
+    ]
 
     def __init__(self):
         self._client: Optional[ClobClient] = None
         self.snapshots: dict[str, MarketSnapshot] = {}
+        self.market_ids: dict[str, dict] = {}   # populated by _discover_markets
         self._callbacks: list = []
         self._running = False
 
@@ -433,6 +444,47 @@ class PolymarketMonitor:
                 },
             )
         return self._client
+
+    async def _discover_markets(self):
+        """Fetch active markets from CLOB and match against BTC/ETH up/down keywords."""
+        log.info("Discovering active Polymarket markets…")
+        try:
+            client = self._get_client()
+            loop = asyncio.get_event_loop()
+            # get_markets returns paginated results; fetch first page
+            resp = await loop.run_in_executor(None, lambda: client.get_markets())
+            markets = resp.data if hasattr(resp, "data") else (resp if isinstance(resp, list) else [])
+
+            found: dict[str, dict] = {}
+            for m in markets:
+                question = (getattr(m, "question", "") or "").lower()
+                tokens = getattr(m, "tokens", []) or []
+                for token in tokens:
+                    token_id = getattr(token, "token_id", None)
+                    outcome = (getattr(token, "outcome", "") or "").lower()
+                    if not token_id:
+                        continue
+                    for asset, direction, duration, keywords in self.SEARCH_TERMS:
+                        asset_kw = keywords[:2]   # e.g. ["btc", "bitcoin"]
+                        dir_kw   = keywords[2]     # e.g. "higher"
+                        dur_kws  = keywords[3:]    # e.g. ["5 min", "5min"]
+                        if (any(k in question for k in asset_kw) and
+                                dir_kw in question and
+                                any(k in question for k in dur_kws) and
+                                "yes" in outcome):
+                            found[token_id] = {"asset": asset, "direction": direction, "duration": duration}
+                            log.info("Discovered market: %s → %s %s %s", token_id[:16], asset, direction, duration)
+
+            if found:
+                self.market_ids = found
+                log.info("Discovered %d markets", len(found))
+            else:
+                log.warning("No markets matched search terms — check Polymarket for active BTC/ETH up/down markets")
+                self.market_ids = self.FALLBACK_MARKET_IDS
+
+        except Exception as e:
+            log.error("Market discovery failed: %s — using fallback IDs", e)
+            self.market_ids = self.FALLBACK_MARKET_IDS
 
     def on_snapshot(self, cb):
         self._callbacks.append(cb)
@@ -474,10 +526,16 @@ class PolymarketMonitor:
 
     async def run(self, poll_interval: float = 2.0):
         self._running = True
+        await self._discover_markets()
         while self._running:
+            if not self.market_ids:
+                log.warning("No market IDs — retrying discovery in 30s")
+                await asyncio.sleep(30)
+                await self._discover_markets()
+                continue
             tasks = [
                 self._fetch_market(mid, meta)
-                for mid, meta in self.MARKET_IDS.items()
+                for mid, meta in self.market_ids.items()
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for snap in results:
