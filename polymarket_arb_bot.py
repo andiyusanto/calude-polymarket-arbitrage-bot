@@ -711,19 +711,6 @@ class PolymarketMonitor:
             log.error("Market discovery failed: %s", e, exc_info=True)
             self.market_ids = self.FALLBACK_MARKET_IDS
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(GAMMA_URL, params=params,
-                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status != 200:
-                        log.error("Gamma API returned HTTP %s", resp.status)
-                        self.market_ids = self.FALLBACK_MARKET_IDS
-                        return
-                    raw = await resp.json(content_type=None)
-
-            markets = raw if isinstance(raw, list) else raw.get("markets", raw.get("data", []))
-            log.info("Gamma API returned %d markets", len(markets))
-
     def on_snapshot(self, cb):
         self._callbacks.append(cb)
 
