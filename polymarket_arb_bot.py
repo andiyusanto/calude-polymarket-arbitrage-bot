@@ -221,6 +221,18 @@ class Database:
                 acted_on    INTEGER NOT NULL DEFAULT 0,
                 logged_at   REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS market_stats (
+                market_id   TEXT PRIMARY KEY,
+                asset       TEXT NOT NULL,
+                direction   TEXT NOT NULL,
+                duration    TEXT NOT NULL,
+                total       INTEGER NOT NULL DEFAULT 0,
+                wins        INTEGER NOT NULL DEFAULT 0,
+                total_pnl   REAL NOT NULL DEFAULT 0,
+                last_trade  REAL NOT NULL DEFAULT 0,
+                blacklisted INTEGER NOT NULL DEFAULT 0
+            );
         """)
         self.conn.commit()
 
@@ -293,6 +305,50 @@ class Database:
             return 0.0
         return wins / total * 100
 
+    def update_market_stats(self, market_id: str, asset: str, direction: str,
+                             duration: str, pnl: float):
+        """Upsert per-market stats and auto-blacklist losers."""
+        self.conn.execute("""
+            INSERT INTO market_stats (market_id, asset, direction, duration,
+                total, wins, total_pnl, last_trade)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(market_id) DO UPDATE SET
+                total      = total + 1,
+                wins       = wins + (CASE WHEN excluded.total_pnl > 0 THEN 1 ELSE 0 END),
+                total_pnl  = total_pnl + excluded.total_pnl,
+                last_trade = excluded.last_trade
+        """, (market_id, asset, direction, duration,
+              1 if pnl > 0 else 0, pnl, time.time()))
+
+        # Blacklist: ≥5 trades and win rate < 35%
+        self.conn.execute("""
+            UPDATE market_stats
+            SET blacklisted = 1
+            WHERE market_id = ? AND total >= 5
+              AND CAST(wins AS REAL) / total < 0.35
+        """, (market_id,))
+        self.conn.commit()
+
+    def is_blacklisted(self, market_id: str) -> bool:
+        cur = self.conn.execute(
+            "SELECT blacklisted FROM market_stats WHERE market_id = ?", (market_id,)
+        )
+        row = cur.fetchone()
+        return bool(row and row[0])
+
+    def market_win_rates(self) -> list[dict]:
+        cur = self.conn.execute("""
+            SELECT market_id, asset, direction, duration,
+                   total, wins,
+                   ROUND(CAST(wins AS REAL) / total * 100, 1) as win_rate,
+                   ROUND(total_pnl, 2) as total_pnl,
+                   blacklisted
+            FROM market_stats
+            ORDER BY win_rate DESC
+        """)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Telegram notifier
@@ -337,16 +393,32 @@ class TelegramNotifier:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class BinancePriceFeed:
-    STREAMS = "btcusdt@ticker/ethusdt@ticker"
+    # ticker for price + depth for order flow imbalance
+    STREAMS = "btcusdt@ticker/ethusdt@ticker/btcusdt@depth20@100ms/ethusdt@depth20@100ms"
 
     def __init__(self):
         self.prices: dict[str, float] = {"BTC": 0.0, "ETH": 0.0}
         self._prev: dict[str, float] = {"BTC": 0.0, "ETH": 0.0}
+        # Order flow imbalance: ratio of bid_vol / (bid_vol + ask_vol), 0-1
+        # 0.5 = neutral, >0.6 = buy pressure, <0.4 = sell pressure
+        self.ofi: dict[str, float] = {"BTC": 0.5, "ETH": 0.5}
         self._running = False
         self._callbacks: list = []
 
     def on_update(self, cb):
         self._callbacks.append(cb)
+
+    def _parse_depth(self, asset: str, data: dict):
+        """Compute order flow imbalance from top-20 depth snapshot."""
+        try:
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            bid_vol = sum(float(b[1]) for b in bids[:10])
+            ask_vol = sum(float(a[1]) for a in asks[:10])
+            total = bid_vol + ask_vol
+            self.ofi[asset] = bid_vol / total if total > 0 else 0.5
+        except (ValueError, IndexError, ZeroDivisionError):
+            pass
 
     async def run(self):
         self._running = True
@@ -365,12 +437,21 @@ class BinancePriceFeed:
                             msg = json.loads(raw)
                             data = msg.get("data", {})
                             stream = msg.get("stream", "")
+
+                            # Determine asset
                             if "btcusdt" in stream:
                                 asset = "BTC"
                             elif "ethusdt" in stream:
                                 asset = "ETH"
                             else:
                                 continue
+
+                            # Depth stream → update OFI only
+                            if "@depth" in stream:
+                                self._parse_depth(asset, data)
+                                continue
+
+                            # Ticker stream → update price
                             new_price = float(data.get("c", 0))
                             if new_price <= 0:
                                 continue
@@ -555,7 +636,10 @@ class PolymarketMonitor:
 
 class SignalEngine:
     """
-    Computes fair value from CEX prices and detects lag opportunities.
+    Computes fair value from CEX prices using:
+      1. Multi-timeframe momentum (1min + 5min + 15min must agree)
+      2. Order flow imbalance (Binance top-10 bid/ask volume ratio)
+    Confidence score scales position size via KellySizer.
     """
 
     def __init__(self, price_feed: BinancePriceFeed):
@@ -565,42 +649,85 @@ class SignalEngine:
     def record_price(self, asset: str, price: float):
         hist = self._price_history[asset]
         hist.append(price)
-        if len(hist) > 300:   # keep last 300 ticks
+        if len(hist) > 1000:  # ~16 min at 1 tick/sec
             hist.pop(0)
+
+    def _momentum(self, hist: list[float], window: int) -> float:
+        """Returns momentum % over the last `window` ticks."""
+        if len(hist) < window:
+            return 0.0
+        start = hist[-window]
+        current = hist[-1]
+        return (current - start) / start * 100 if start > 0 else 0.0
 
     def _compute_fair_value(self, asset: str, direction: str, duration: str) -> tuple[float, float]:
         """
-        Returns (fair_value_prob, confidence_score).
-        Uses recent price momentum to estimate UP probability.
+        Returns (fair_value_prob, confidence_score 0-100).
+
+        Three signals are combined:
+          - Short-term momentum (1min window)
+          - Medium-term momentum matching duration
+          - Order flow imbalance from Binance depth stream
+
+        All three must agree directionally for max confidence.
         """
+        import math
         hist = self._price_history[asset]
         current = self.feed.prices.get(asset, 0)
-        if current == 0 or len(hist) < 10:
+        ofi = self.feed.ofi.get(asset, 0.5)
+
+        if current == 0 or len(hist) < 30:
             return 0.5, 0.0
 
-        # Short-term momentum signal
-        window = 20 if duration == "5min" else 60
-        lookback = hist[-min(window, len(hist)):]
-        start = lookback[0]
-        if start == 0:
-            return 0.5, 0.0
+        # ── Multi-timeframe momentum ────────────────────────────────────────
+        mom_1min  = self._momentum(hist, min(60,  len(hist)))
+        mom_5min  = self._momentum(hist, min(300, len(hist)))
+        mom_15min = self._momentum(hist, min(900, len(hist)))
 
-        momentum_pct = (current - start) / start * 100
+        duration_mom = mom_5min if duration == "5min" else mom_15min
 
-        # Sigmoid-like mapping: strong upward momentum → higher UP probability
-        import math
-        scale = 2.0  # sensitivity
-        raw_prob = 1 / (1 + math.exp(-momentum_pct * scale / 100 * 10))
+        # All three timeframes must agree in direction
+        signs = [
+            1 if m > 0 else (-1 if m < 0 else 0)
+            for m in [mom_1min, mom_5min, mom_15min]
+        ]
+        timeframe_agreement = len(set(s for s in signs if s != 0)) == 1
 
-        if direction == "DOWN":
-            fair_value = 1.0 - raw_prob
-        else:
-            fair_value = raw_prob
+        # ── OFI signal ─────────────────────────────────────────────────────
+        # OFI > 0.55 = buy pressure, < 0.45 = sell pressure
+        ofi_bullish  = ofi > 0.55
+        ofi_bearish  = ofi < 0.45
+        ofi_neutral  = not ofi_bullish and not ofi_bearish
 
-        # Confidence: how many ticks we have, how extreme the momentum
-        tick_confidence = min(len(hist) / window, 1.0) * 60
-        momentum_confidence = min(abs(momentum_pct) / 2.0, 1.0) * 40
-        confidence = tick_confidence + momentum_confidence
+        # ── Combined fair value probability ────────────────────────────────
+        # Sigmoid on duration momentum
+        scale = 2.0
+        raw_prob = 1 / (1 + math.exp(-duration_mom * scale / 100 * 10))
+
+        # OFI nudge: push probability 3% toward the OFI-implied direction
+        if ofi_bullish:
+            raw_prob = min(raw_prob + 0.03, 0.99)
+        elif ofi_bearish:
+            raw_prob = max(raw_prob - 0.03, 0.01)
+
+        fair_value = (1.0 - raw_prob) if direction == "DOWN" else raw_prob
+
+        # ── Confidence score (0-100) ────────────────────────────────────────
+        # Base: data sufficiency
+        tick_conf = min(len(hist) / 300, 1.0) * 30          # up to 30 pts
+
+        # Momentum strength
+        mom_conf = min(abs(duration_mom) / 2.0, 1.0) * 30   # up to 30 pts
+
+        # Timeframe agreement bonus
+        agreement_conf = 25.0 if timeframe_agreement else 0.0
+
+        # OFI agreement bonus: OFI direction matches momentum direction
+        mom_is_up = duration_mom > 0
+        ofi_agrees = (mom_is_up and ofi_bullish) or (not mom_is_up and ofi_bearish)
+        ofi_conf = 15.0 if ofi_agrees else (0.0 if ofi_neutral else -10.0)
+
+        confidence = min(tick_conf + mom_conf + agreement_conf + ofi_conf, 100.0)
 
         return fair_value, confidence
 
@@ -611,22 +738,16 @@ class SignalEngine:
         if confidence < CONFIG.confidence_threshold:
             return None
 
-        # YES side
         yes_edge = (fair_value - snap.yes_price) * 100
-        no_edge = ((1 - fair_value) - snap.no_price) * 100
+        no_edge  = ((1 - fair_value) - snap.no_price) * 100
 
         if yes_edge >= CONFIG.min_edge_pct and abs(yes_edge) > abs(no_edge):
-            side = "YES"
-            poly_price = snap.yes_price
-            edge = yes_edge
+            side, poly_price, edge = "YES", snap.yes_price, yes_edge
         elif no_edge >= CONFIG.min_edge_pct:
-            side = "NO"
-            poly_price = snap.no_price
-            edge = no_edge
+            side, poly_price, edge = "NO", snap.no_price, no_edge
         else:
             return None
 
-        # Check lag threshold
         lag = abs((fair_value - snap.yes_price) * 100)
         if lag < CONFIG.lag_threshold_pct:
             return None
@@ -641,6 +762,7 @@ class SignalEngine:
             fair_value=fair_value,
             edge_pct=edge,
             confidence=confidence,
+            kelly_size=0.0,  # filled by KellySizer
         )
 
 
@@ -651,20 +773,43 @@ class SignalEngine:
 class KellySizer:
     def __init__(self, portfolio_value: float = 1000.0):
         self.portfolio_value = portfolio_value
+        self._recent_results: list[bool] = []   # True=win, False=loss
+
+    def record_result(self, win: bool):
+        self._recent_results.append(win)
+        if len(self._recent_results) > 10:
+            self._recent_results.pop(0)
+
+    def _effective_kelly_fraction(self, confidence: float) -> float:
+        """
+        Scale Kelly fraction with confidence (85→100 maps to 0.25→0.5).
+        Also cuts to 0.25 after 3 consecutive losses (losing streak protection).
+        """
+        # Confidence scaling: linearly interpolate between 0.25 and 0.5
+        conf_clamped = max(CONFIG.confidence_threshold, min(confidence, 100.0))
+        conf_range   = 100.0 - CONFIG.confidence_threshold
+        conf_ratio   = (conf_clamped - CONFIG.confidence_threshold) / conf_range if conf_range > 0 else 1.0
+        scaled_kelly = 0.25 + conf_ratio * (CONFIG.kelly_fraction - 0.25)
+
+        # Losing streak: last 3 trades all losses → halve the fraction
+        if len(self._recent_results) >= 3 and not any(self._recent_results[-3:]):
+            scaled_kelly *= 0.5
+            log.info("Losing streak detected — Kelly fraction halved to %.3f", scaled_kelly)
+
+        return scaled_kelly
 
     def size(self, sig: TradeSignal) -> float:
-        """Returns USDC size to trade."""
+        """Returns USDC size to trade, scaled by confidence."""
         p = sig.fair_value
         b = (1.0 / sig.poly_price) - 1.0  # net odds
         if b <= 0 or p <= 0 or p >= 1:
             return 0.0
 
-        # Kelly fraction
-        kelly = (p * b - (1 - p)) / b
-        half_kelly = kelly * CONFIG.kelly_fraction
+        kelly_f  = self._effective_kelly_fraction(sig.confidence)
+        kelly    = (p * b - (1 - p)) / b
+        sized    = kelly * kelly_f
 
-        # Cap at max position %
-        capped = min(half_kelly, CONFIG.max_position_pct / 100)
+        capped = min(sized, CONFIG.max_position_pct / 100)
         capped = max(capped, 0.0)
 
         return round(self.portfolio_value * capped, 2)
@@ -759,50 +904,66 @@ class OrderExecutor:
             )
         return self._client
 
-    async def execute(self, sig: TradeSignal, size_usdc: float) -> Optional[Position]:
+    def _limit_price(self, sig: TradeSignal, snap: MarketSnapshot) -> float:
+        """
+        Post a limit order at mid-price rather than hitting the ask.
+        For YES buys: mid = (best_bid + best_ask) / 2, rounded to 2 decimals.
+        For NO buys:  mid on the NO side = 1 - YES mid.
+        """
+        if snap.asks and snap.bids:
+            best_ask = snap.asks[0][0]
+            best_bid = snap.bids[0][0]
+            yes_mid  = (best_bid + best_ask) / 2
+        else:
+            yes_mid = sig.poly_price
+
+        price = yes_mid if sig.side == "YES" else (1.0 - yes_mid)
+        return round(price, 4)
+
+    async def execute(self, sig: TradeSignal, size_usdc: float,
+                      snap: Optional[MarketSnapshot] = None) -> Optional[Position]:
         # Rate limit
         elapsed = time.time() - self._last_order_time
         if elapsed < CONFIG.order_cooldown_sec:
             await asyncio.sleep(CONFIG.order_cooldown_sec - elapsed)
 
-        trade_id = f"{sig.market_id}-{int(time.time()*1000)}"
+        trade_id   = f"{sig.market_id}-{int(time.time()*1000)}"
+        limit_price = self._limit_price(sig, snap) if snap else sig.poly_price
 
         if not self.live:
-            # Paper trade
             pos = Position(
                 trade_id=trade_id,
                 market_id=sig.market_id,
                 asset=sig.asset,
                 direction=sig.direction,
                 side=sig.side,
-                entry_price=sig.poly_price,
+                entry_price=limit_price,
                 size_usdc=size_usdc,
                 fair_value_at_entry=sig.fair_value,
                 edge_at_entry=sig.edge_pct,
                 status="PAPER",
             )
-            log.info("[PAPER] %s %s %s @ %.4f  size=$%.2f  edge=%.1f%%",
+            log.info("[PAPER] LIMIT %s %s %s @ %.4f (mid)  size=$%.2f  edge=%.1f%%  conf=%.0f%%",
                      sig.side, sig.asset, sig.direction,
-                     sig.poly_price, size_usdc, sig.edge_pct)
+                     limit_price, size_usdc, sig.edge_pct, sig.confidence)
             self._last_order_time = time.time()
             return pos
 
-        # Live order
+        # Live limit order with re-entry retry (up to 3 attempts, 500ms apart)
         for attempt in range(CONFIG.max_retries):
             try:
-                client = self._get_client()
-                loop = asyncio.get_event_loop()
+                client  = self._get_client()
+                loop    = asyncio.get_event_loop()
                 order_args = OrderArgs(
                     token_id=sig.market_id,
-                    price=sig.poly_price,
+                    price=limit_price,
                     size=size_usdc,
                     side="BUY",
                 )
                 resp = await loop.run_in_executor(
-                    None,
-                    lambda: client.create_and_post_order(order_args),
+                    None, lambda: client.create_and_post_order(order_args)
                 )
-                log.info("[LIVE] Order placed: %s", resp)
+                log.info("[LIVE] Limit order placed @ %.4f: %s", limit_price, resp)
                 self._last_order_time = time.time()
                 return Position(
                     trade_id=trade_id,
@@ -810,15 +971,15 @@ class OrderExecutor:
                     asset=sig.asset,
                     direction=sig.direction,
                     side=sig.side,
-                    entry_price=sig.poly_price,
+                    entry_price=limit_price,
                     size_usdc=size_usdc,
                     fair_value_at_entry=sig.fair_value,
                     edge_at_entry=sig.edge_pct,
                     status="OPEN",
                 )
             except Exception as e:
-                backoff = 2 ** attempt
-                log.error("Order failed (attempt %d): %s – retry in %ds", attempt + 1, e, backoff)
+                backoff = 0.5 if attempt < 3 else 2 ** attempt
+                log.error("Order failed (attempt %d): %s – retry in %.1fs", attempt + 1, e, backoff)
                 await asyncio.sleep(backoff)
 
         return None
@@ -923,13 +1084,38 @@ class Dashboard:
             stats_line.plain,
         ])
 
+        # ── Per-market win rates ───────────────────────────────
+        mkt_table = Table(title="Market Win Rates", expand=True, show_lines=False)
+        mkt_table.add_column("Market", style="dim", max_width=18)
+        mkt_table.add_column("Asset")
+        mkt_table.add_column("Dir")
+        mkt_table.add_column("Trades")
+        mkt_table.add_column("Win%")
+        mkt_table.add_column("P&L")
+        mkt_table.add_column("Status")
+
+        for m in self.db.market_win_rates():
+            wr_color = "green" if m["win_rate"] >= 50 else "red"
+            pnl_color = "green" if m["total_pnl"] >= 0 else "red"
+            status = "[red]BLACKLISTED[/red]" if m["blacklisted"] else "[green]active[/green]"
+            mkt_table.add_row(
+                str(m["market_id"])[-14:],
+                m["asset"],
+                m["direction"],
+                str(m["total"]),
+                f"[{wr_color}]{m['win_rate']}%[/{wr_color}]",
+                f"[{pnl_color}]${m['total_pnl']:+.2f}[/{pnl_color}]",
+                status,
+            )
+
         layout = Layout()
         layout.split_column(
             Layout(Panel(header), size=3),
             Layout(Panel(price_line), size=3),
             Layout(Panel(stats_line), size=3),
             Layout(pos_table, size=10),
-            Layout(trades_table),
+            Layout(trades_table, size=14),
+            Layout(mkt_table),
         )
         return Panel(layout, title="[bold blue]Polymarket Latency Arb[/bold blue]", border_style="blue")
 
@@ -959,6 +1145,11 @@ class ArbBot:
         if self.kill_switch:
             return
 
+        # Per-market blacklist check
+        if self.db.is_blacklisted(snap.market_id):
+            log.debug("Skipping blacklisted market %s", snap.market_id)
+            return
+
         # Check daily drawdown kill switch
         daily_pnl = self.db.daily_pnl()
         portfolio = self.sizer.portfolio_value
@@ -976,7 +1167,7 @@ class ArbBot:
             return
 
         size = self.sizer.size(sig)
-        if size < 1.0:   # minimum $1
+        if size < 1.0:
             return
 
         # ── Slippage guard ─────────────────────────────────────────────────
@@ -993,20 +1184,33 @@ class ArbBot:
 
         acted = False
         if sig.edge_pct >= CONFIG.min_edge_pct and sig.confidence >= CONFIG.confidence_threshold:
-            pos = await self.executor.execute(sig, size)
+            pos = await self.executor.execute(sig, size, snap=snap)
             if pos:
                 self._positions.append(pos)
                 self.dashboard.positions = self._positions
                 mode = "LIVE" if self.live else "PAPER"
                 self.db.insert_trade(pos, mode)
                 acted = True
+
+                # Simulate close for paper trades and update market stats
+                if pos.status == "PAPER":
+                    pnl = (sig.fair_value - pos.entry_price) * size
+                    self.db.update_trade(pos.trade_id, "CLOSED", pnl, time.time())
+                    self.db.update_market_stats(
+                        pos.market_id, pos.asset, pos.direction, snap.duration, pnl
+                    )
+                    self.sizer.record_result(pnl > 0)
+                    pos.pnl = pnl
+                    pos.status = "CLOSED"
+
+                ofi = self.price_feed.ofi.get(sig.asset, 0.5)
                 msg = (
                     f"{'🟢' if self.live else '📋'} *{'LIVE' if self.live else 'PAPER'} TRADE*\n"
-                    f"Market: {sig.asset} {sig.direction} {sig.duration}\n"
-                    f"Side: {sig.side} @ best={slip.best_price:.4f} VWAP={slip.vwap:.4f}\n"
+                    f"Market: {sig.asset} {sig.direction} {snap.duration}\n"
+                    f"Side: {sig.side} @ limit={pos.entry_price:.4f}  (VWAP={slip.vwap:.4f})\n"
                     f"Slippage: {slip.slippage_pct:.2f}%  Edge: {sig.edge_pct:.1f}%\n"
                     f"Fair Value: {sig.fair_value:.4f}  Confidence: {sig.confidence:.0f}%\n"
-                    f"Size: ${size:.2f}"
+                    f"OFI: {ofi:.2f}  Size: ${size:.2f}"
                 )
                 await self.notifier.send(msg)
 
