@@ -531,58 +531,57 @@ class PolymarketMonitor:
         return self._client
 
     async def _discover_markets(self):
-        """Fetch active markets from CLOB and match against BTC/ETH up/down keywords."""
-        log.info("Discovering active Polymarket markets…")
+        """
+        Fetch active markets from Polymarket's Gamma API (which powers the
+        frontend) and extract token IDs for BTC/ETH up/down short-duration markets.
+        The CLOB /markets endpoint only lists markets with active order books and
+        returns 0 results when queried unauthenticated — Gamma API is the correct
+        source for market discovery.
+        """
+        log.info("Discovering active Polymarket markets via Gamma API…")
+        GAMMA_URL = "https://gamma-api.polymarket.com/markets"
+
+        params = {
+            "closed":     "false",
+            "limit":      500,
+            "order":      "volume24hr",
+            "ascending":  "false",
+            "tag_slug":   "crypto",   # filter to crypto markets
+        }
+
+        ASSET_KEYWORDS = {
+            "BTC": ["btc", "bitcoin"],
+            "ETH": ["eth", "ethereum", "ether"],
+        }
+        DIR_KEYWORDS = {
+            "UP":   ["higher", "above", "up", "increase", "rise", "over"],
+            "DOWN": ["lower", "below", "down", "decrease", "fall", "under"],
+        }
+        DUR_KEYWORDS = {
+            "5min":  ["5 min", "5min", "5-min", "5 m", "five min", "next 5", "5 minutes"],
+            "15min": ["15 min", "15min", "15-min", "15 m", "fifteen min", "next 15", "15 minutes"],
+        }
+
         try:
-            client = self._get_client()
-            loop   = asyncio.get_event_loop()
+            async with aiohttp.ClientSession() as session:
+                async with session.get(GAMMA_URL, params=params,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        log.error("Gamma API returned HTTP %s", resp.status)
+                        self.market_ids = self.FALLBACK_MARKET_IDS
+                        return
+                    raw = await resp.json(content_type=None)
 
-            # ── Paginate through ALL markets ────────────────────────────────
-            all_markets = []
-            cursor = "MA=="
-            while True:
-                resp = await loop.run_in_executor(
-                    None, lambda c=cursor: client.get_markets(next_cursor=c)
-                )
-                page = resp.data if hasattr(resp, "data") else (resp if isinstance(resp, list) else [])
-                if not page:
-                    break
-                all_markets.extend(page)
-                next_cursor = getattr(resp, "next_cursor", None)
-                if not next_cursor or next_cursor == cursor:
-                    break
-                cursor = next_cursor
-
-            log.info("CLOB returned %d total markets", len(all_markets))
-
-            # ── Debug: log all question strings so we can see exact wording ─
-            for m in all_markets:
-                q = (getattr(m, "question", "") or "").strip()
-                if q:
-                    log.debug("MARKET QUESTION: %s", q)
-
-            # ── Broad keyword matching ──────────────────────────────────────
-            # Polymarket 5M/15M markets use varied phrasing, e.g.:
-            #   "Will BTC be above X at Y:00?"
-            #   "Bitcoin price higher in 5 minutes?"
-            #   "Will the price of BTC increase in the next 5 minutes?"
-            ASSET_KEYWORDS = {
-                "BTC": ["btc", "bitcoin"],
-                "ETH": ["eth", "ethereum", "ether"],
-            }
-            DIR_KEYWORDS = {
-                "UP":   ["higher", "above", "up", "increase", "rise", "bull"],
-                "DOWN": ["lower", "below", "down", "decrease", "fall", "bear"],
-            }
-            DUR_KEYWORDS = {
-                "5min":  ["5 min", "5min", "5-min", "5m ", "five min", "next 5"],
-                "15min": ["15 min", "15min", "15-min", "15m ", "fifteen min", "next 15"],
-            }
+            markets = raw if isinstance(raw, list) else raw.get("markets", raw.get("data", []))
+            log.info("Gamma API returned %d markets", len(markets))
 
             found: dict[str, dict] = {}
-            for m in all_markets:
-                question = (getattr(m, "question", "") or "").lower()
-                tokens   = getattr(m, "tokens", []) or []
+            for m in markets:
+                question = (m.get("question") or m.get("title") or "").lower().strip()
+                if not question:
+                    continue
+
+                log.debug("GAMMA QUESTION: %s", question)
 
                 for asset, asset_kws in ASSET_KEYWORDS.items():
                     if not any(k in question for k in asset_kws):
@@ -593,31 +592,38 @@ class PolymarketMonitor:
                         for duration, dur_kws in DUR_KEYWORDS.items():
                             if not any(k in question for k in dur_kws):
                                 continue
-                            # Match found — grab the YES token
-                            for token in tokens:
-                                token_id = getattr(token, "token_id", None)
-                                outcome  = (getattr(token, "outcome", "") or "").lower()
-                                if token_id and "yes" in outcome:
-                                    found[token_id] = {
-                                        "asset":     asset,
-                                        "direction": direction,
-                                        "duration":  duration,
-                                    }
-                                    log.info(
-                                        "Discovered: %s → %s %s %s  (q: %.60s…)",
-                                        token_id[:16], asset, direction, duration, question
-                                    )
+
+                            # Gamma API embeds clobTokenIds or conditionId
+                            clob_token_ids = m.get("clobTokenIds") or []
+                            if isinstance(clob_token_ids, str):
+                                import json as _json
+                                try:
+                                    clob_token_ids = _json.loads(clob_token_ids)
+                                except Exception:
+                                    clob_token_ids = []
+
+                            # First token = YES, second = NO
+                            if clob_token_ids:
+                                token_id = clob_token_ids[0]  # YES token
+                                found[token_id] = {
+                                    "asset":     asset,
+                                    "direction": direction,
+                                    "duration":  duration,
+                                }
+                                log.info(
+                                    "Discovered: %s → %s %s %s  (q: %.70s)",
+                                    str(token_id)[:16], asset, direction, duration, question
+                                )
 
             if found:
                 self.market_ids = found
                 log.info("Discovered %d tradeable markets", len(found))
             else:
-                # Last resort: log ALL questions at WARNING level so user can see them
-                log.warning("No markets matched. All questions seen:")
-                for m in all_markets:
-                    q = (getattr(m, "question", "") or "").strip()
+                log.warning("No BTC/ETH up/down markets found. Sample questions:")
+                for m in markets[:20]:
+                    q = (m.get("question") or m.get("title") or "").strip()
                     if q:
-                        log.warning("  QUESTION: %s", q)
+                        log.warning("  GAMMA: %s", q)
                 self.market_ids = self.FALLBACK_MARKET_IDS
 
         except Exception as e:
