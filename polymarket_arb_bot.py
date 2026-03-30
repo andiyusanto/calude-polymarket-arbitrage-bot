@@ -84,7 +84,8 @@ class Config:
 
     # Risk controls
     kill_switch_drawdown: float = 10.0
-    max_daily_profit_pct: float = 50.0   # Safety cap
+    max_daily_profit_pct: float = 80.0   # 50.0   # Safety cap
+    daily_profit_pause_hours: float = 6.0   # Pause duration after target hit
 
     # Fee & Slippage
     taker_fee_pct: float = 1.65
@@ -104,6 +105,17 @@ class Config:
 
 CONFIG = Config()
 
+
+class DailyProfitPauser:
+    def __init__(self):
+        self.pause_until: float = 0.0
+
+    def is_paused(self) -> bool:
+        return time.time() < self.pause_until
+
+    def trigger_pause(self, profit_pct: float):
+        self.pause_until = time.time() + (CONFIG.daily_profit_pause_hours * 3600)
+        log.info(f"🎯 DAILY PROFIT TARGET HIT (+{profit_pct:.1f}%) — Pausing for {CONFIG.daily_profit_pause_hours} hours")
 
 class SpikeCooldown:
     def __init__(self):
@@ -1671,6 +1683,7 @@ class ArbBot:
         self.kill_switch = False
         self._positions: list[Position] = []
         self.spike_cooldown = SpikeCooldown()   # ← Add this line
+        self.daily_pauser = DailyProfitPauser()   # ← Add this
 
     async def _on_price_update(self, snap: PriceSnapshot):
         self.signal_engine.record_price(snap.asset, snap.price)
@@ -1692,19 +1705,23 @@ class ArbBot:
             log.debug("Skipping blacklisted market %s", snap.market_id)
             return
 
-        # Check daily drawdown kill switch + daily profit ceiling
+        # === DAILY PROFIT TARGET CHECK ===
         daily_pnl = self.db.daily_pnl()
-        portfolio = self.sizer.portfolio_value
-        if portfolio > 0:
-            daily_pnl_pct = daily_pnl / portfolio * 100
-            if (-daily_pnl_pct) >= CONFIG.kill_switch_drawdown:
-                if not self.kill_switch:
-                    self.kill_switch = True
-                    self.dashboard.kill_switch_active = True
-                    msg = f"⛔ KILL SWITCH – Drawdown exceeded {CONFIG.kill_switch_drawdown}%"
-                    log.critical(msg)
+        if CONFIG.max_daily_profit_pct > 0 and self.sizer.portfolio_value > 0:
+            profit_pct = (daily_pnl / self.sizer.portfolio_value) * 100
+            
+            if profit_pct >= CONFIG.max_daily_profit_pct:
+                if not self.daily_pauser.is_paused():
+                    self.daily_pauser.trigger_pause(profit_pct)
+                    msg = f"🎯 DAILY PROFIT TARGET HIT (+{profit_pct:.1f}%) — Pausing for {CONFIG.daily_profit_pause_hours} hours"
+                    log.info(msg)
                     await self.notifier.send(f"*{msg}*")
+                return   # Skip trading during pause
+
+            # Skip if in spike cooldown
+            if hasattr(self, 'spike_cooldown') and self.spike_cooldown.is_in_cooldown():
                 return
+            
             if daily_pnl_pct >= CONFIG.max_daily_profit_pct:
                 if not self.kill_switch:
                     self.kill_switch = True
