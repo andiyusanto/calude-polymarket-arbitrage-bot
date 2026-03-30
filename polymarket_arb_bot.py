@@ -74,8 +74,8 @@ class Config:
     min_edge_pct: float = 2.0           #3.5           # Lowered — fee filter now handles the real floor
     lag_threshold_pct: float =  1.0     #3.0      # Polymarket lag vs CEX to flag (%)
     max_position_pct: float = 8.0       # Max position as % of portfolio
-    confidence_threshold: float = 45.0  #65.0  #90.0  # Raised — fewer but higher-quality signals
-    kelly_fraction: float =  0.4        #0.5         # Half-Kelly
+    confidence_threshold: float = 65.0  #90.0  # Raised — fewer but higher-quality signals
+    kelly_fraction: float = 0.5         # Half-Kelly
     kill_switch_drawdown: float = 20.0  # Daily drawdown % to halt all trading
     max_slippage_pct: float = 1.5       # Max acceptable VWAP slippage vs best price (%)
 
@@ -1314,9 +1314,9 @@ class SignalEngine:
               f"Fair={fair_value:.4f} | Poly={snap.yes_price:.4f} | "
               f"Edge={edge:+.2f}% | Conf={confidence:.1f}%")
         
-        if confidence >= 40:   # temporary debug line
+        if confidence >= 65:   # temporary debug line
             log.info(f"STRONG EDGE → {snap.asset} {snap.direction} | Edge={edge:+.2f}% | Conf={confidence:.1f}%")
-        
+
         if confidence < CONFIG.confidence_threshold:
             return None
 
