@@ -59,6 +59,7 @@ console = Console()
 
 @dataclass
 @dataclass
+@dataclass
 class Config:
     # Polymarket
     polymarket_key: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
@@ -98,6 +99,7 @@ class Config:
     order_cooldown_sec: float = 0.8
     ws_reconnect_delay: float = 5.0
     max_retries: int = 5
+    
 # class Config:
 #     # Polymarket
 #     polymarket_key: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
