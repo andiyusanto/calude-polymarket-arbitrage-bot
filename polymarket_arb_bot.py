@@ -60,7 +60,7 @@ console = Console()
 @dataclass
 @dataclass
 class Config:
-    # Polymarket credentials (keep as is)
+    # Polymarket
     polymarket_key: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
     polymarket_api_key: str = os.getenv("POLYMARKET_API_KEY", "")
     polymarket_secret: str = os.getenv("POLYMARKET_API_SECRET", "")
@@ -71,23 +71,27 @@ class Config:
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # === TUNED TRADING PARAMETERS ===
-    min_edge_pct: float = 4.2           # More selective
+    # Trading parameters
+    min_edge_pct: float = 4.2
     lag_threshold_pct: float = 2.0
-    max_position_pct: float = 3.5       # Safer sizing
+    max_position_pct: float = 3.5
     confidence_threshold: float = 58.0
-    kelly_fraction: float = 0.28        # Conservative
+    kelly_fraction: float = 0.28
 
     # Risk controls
     kill_switch_drawdown: float = 10.0
-    max_daily_profit_pct: float = 60.0  # Optional circuit breaker
+    max_daily_profit_pct: float = 60.0
 
-    # Fee & Slippage simulation (realistic paper trading)
+    # Fee & Slippage
     taker_fee_pct: float = 1.65
     simulated_slippage_pct: float = 0.5
     fee_buffer_pct: float = 0.7
 
-    # Other settings
+    # Spike cooldown
+    spike_threshold_pct: float = 0.35
+    spike_cooldown_sec: float = 18.0
+
+    # Other
     binance_ws_url: str = "wss://stream.binance.us:9443/stream"
     binance_ws_fallback: str = "wss://data-stream.binance.com/stream"
     db_path: str = "trades.db"
@@ -159,6 +163,20 @@ class Config:
 #     ws_reconnect_delay: float = 5.0
 #     max_retries: int = 5
 
+
+class SpikeCooldown:
+    def __init__(self):
+        self.last_spike_time: float = 0.0
+        self.cooldown_until: float = 0.0
+
+    def is_in_cooldown(self) -> bool:
+        return time.time() < self.cooldown_until
+
+    def check_and_update(self, price_change_pct: float):
+        now = time.time()
+        if abs(price_change_pct) >= CONFIG.spike_threshold_pct:
+            self.cooldown_until = now + CONFIG.spike_cooldown_sec
+            log.info(f"⚠️ Big CEX spike detected ({price_change_pct:+.2f}%) — cooldown for {CONFIG.spike_cooldown_sec}s")
 
 CONFIG = Config()
 
@@ -1842,14 +1860,23 @@ class ArbBot:
         self.dashboard = Dashboard(self.db, self.price_feed, live)
         self.kill_switch = False
         self._positions: list[Position] = []
+        self.spike_cooldown = SpikeCooldown()   # ← Add this line
 
     async def _on_price_update(self, snap: PriceSnapshot):
         self.signal_engine.record_price(snap.asset, snap.price)
+
+        # Spike cooldown check
+        if abs(snap.change_pct) >= CONFIG.spike_threshold_pct:
+            self.spike_cooldown.check_and_update(snap.change_pct)
 
     async def _on_market_snapshot(self, snap: MarketSnapshot):
         if self.kill_switch:
             return
 
+        # Skip if in spike cooldown
+        if self.spike_cooldown.is_in_cooldown():
+            return
+        
         # Per-market blacklist check
         if self.db.is_blacklisted(snap.market_id):
             log.debug("Skipping blacklisted market %s", snap.market_id)
