@@ -1331,7 +1331,7 @@ class SignalEngine:
               f"Fair={fair_value:.4f} | Poly={snap.yes_price:.4f} | "
               f"Edge={edge:+.2f}% | Conf={confidence:.1f}%")
         
-        if confidence >= 65:   # temporary debug line
+        if confidence >= CONFIG.confidence_threshold:   # temporary debug line
             log.info(f"STRONG EDGE → {snap.asset} {snap.direction} | Edge={edge:+.2f}% | Conf={confidence:.1f}%")
 
         if confidence < CONFIG.confidence_threshold:
