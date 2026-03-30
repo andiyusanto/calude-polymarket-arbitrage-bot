@@ -70,7 +70,7 @@ class Config:
     poly_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     binance_ws_url: str = "wss://stream.binance.us:9443/stream"
     binance_ws_fallback: str = "wss://data-stream.binance.com/stream"
-
+    
     # Telegram
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -85,7 +85,7 @@ class Config:
     # Risk controls
     kill_switch_drawdown: float = 12.0
     max_daily_profit_pct: float = 80.0
-    daily_profit_pause_hours: float = 6.0 
+    daily_profit_pause_hours: float = 6.0
 
     # Fee & Slippage
     taker_fee_pct: float = 1.65
