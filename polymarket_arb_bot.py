@@ -561,7 +561,7 @@ class PolymarketMonitor:
         self.market_ids: dict[str, dict] = {}   # populated by _discover_markets
         self._callbacks: list = []
         self._running = False
-        # Executor for sync CLOB calls — bounded to avoid thread explosion
+        self.poly_ws = None   # injected by ArbBot.run() for staleness checks
         self._executor = __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor(max_workers=6)
 
     def _get_client(self) -> ClobClient:
@@ -856,8 +856,9 @@ class PolymarketMonitor:
                 await asyncio.sleep(backoff)
         return None
 
-    async def run(self, poll_interval: float = 1.5):
+    async def run(self, poll_interval: float = 1.5, poly_ws: Optional["PolymarketWSFeed"] = None):
         self._running = True
+        self.poly_ws = poly_ws   # reference for staleness check
         await self._discover_markets()
         last_discovery = time.time()
         REDISCOVER_INTERVAL = 180  # re-discover every 3 minutes (5M markets rotate)
@@ -882,26 +883,33 @@ class PolymarketMonitor:
                 last_discovery = time.time()
                 continue
 
-            # Fix 1: reduced batch size to 2 since WS is primary feed
-            active_ids = {
-                mid: meta for mid, meta in self.market_ids.items()
-                if not meta.get("end_ts") or meta["end_ts"] > time.time() + 30
-            }
+            # Fix 1: only REST-poll when WS is stale (>25s without message)
+            # When WS is healthy, REST is purely a no-op heartbeat
+            ws_healthy = self.poly_ws.is_healthy if self.poly_ws else False
+            if ws_healthy:
+                log.debug("WS healthy — skipping REST poll cycle")
+            else:
+                if not ws_healthy:
+                    log.warning("WS stale — falling back to REST for one cycle")
+                active_ids = {
+                    mid: meta for mid, meta in self.market_ids.items()
+                    if not meta.get("end_ts") or meta["end_ts"] > time.time() + 30
+                }
 
-            items = list(active_ids.items())
-            BATCH_SIZE = 2
-            for i in range(0, len(items), BATCH_SIZE):
-                batch = items[i:i + BATCH_SIZE]
-                results = await asyncio.gather(
-                    *[self._fetch_market(mid, meta) for mid, meta in batch],
-                    return_exceptions=True
-                )
-                for snap in results:
-                    if isinstance(snap, MarketSnapshot):
-                        self.snapshots[snap.market_id] = snap
-                        for cb in self._callbacks:
-                            asyncio.create_task(cb(snap))
-                await asyncio.sleep(0.1)  # gap between batches
+                items = list(active_ids.items())
+                BATCH_SIZE = 2
+                for i in range(0, len(items), BATCH_SIZE):
+                    batch = items[i:i + BATCH_SIZE]
+                    results = await asyncio.gather(
+                        *[self._fetch_market(mid, meta) for mid, meta in batch],
+                        return_exceptions=True
+                    )
+                    for snap in results:
+                        if isinstance(snap, MarketSnapshot):
+                            self.snapshots[snap.market_id] = snap
+                            for cb in self._callbacks:
+                                asyncio.create_task(cb(snap))
+                    await asyncio.sleep(0.1)
 
             # Fix 2: random jitter prevents synchronised rate-limit hits
             await asyncio.sleep(poll_interval + random.uniform(0.1, 0.3))
@@ -916,27 +924,40 @@ class PolymarketMonitor:
 
 class PolymarketWSFeed:
     """
-    Subscribes to Polymarket's CLOB WebSocket market channel for real-time
-    order book updates. Replaces REST polling for active tokens.
+    Hybrid WS primary + REST fallback for Polymarket order books.
 
-    Protocol:
-      Connect → send {"assets_ids": [...], "type": "Market"}
-      Receive book_update and price_change events
+    Architecture:
+      - WS receives pushed book updates in real-time (primary)
+      - _last_msg_time tracks liveness — if stale >25s, REST takes over
+      - Tries both known subscription message formats on connect
+      - Logs raw WS messages at DEBUG on first connect so you can see
+        the actual payload structure and tune the parser
     """
 
+    WS_STALE_SEC = 25.0   # seconds of silence before declaring WS dead
+
     def __init__(self):
-        self._books: dict[str, dict] = {}   # token_id → {asks, bids, yes_price}
+        self._books: dict[str, dict] = {}
         self._callbacks: list = []
-        self._market_meta: dict[str, dict] = {}  # token_id → {asset, direction, duration}
+        self._market_meta: dict[str, dict] = {}
         self._running = False
         self._ws = None
+        self._last_msg_time: float = 0.0   # ← staleness tracker
+        self._connected: bool = False
+        self._debug_logged: bool = False    # log raw payload once on first connect
 
     def on_snapshot(self, cb):
         self._callbacks.append(cb)
 
     def set_markets(self, market_ids: dict[str, dict]):
-        """Update the set of token IDs to subscribe to."""
         self._market_meta = market_ids
+
+    @property
+    def is_healthy(self) -> bool:
+        """True if WS is connected and received a message in the last 25s."""
+        if not self._connected:
+            return False
+        return (time.time() - self._last_msg_time) < self.WS_STALE_SEC
 
     def get_snapshot(self, market_id: str) -> Optional[MarketSnapshot]:
         book = self._books.get(market_id)
@@ -955,38 +976,88 @@ class PolymarketWSFeed:
         )
 
     def _parse_book(self, data: dict) -> Optional[tuple[str, dict]]:
-        """Parse a book_update or price_change message into (token_id, book_dict)."""
         try:
-            asset_id = data.get("asset_id") or data.get("market")
-            if not asset_id:
+            # Polymarket uses asset_id, asset, or market depending on event type
+            asset_id = (data.get("asset_id") or data.get("asset") or
+                        data.get("market") or data.get("token_id"))
+            if not asset_id or str(asset_id) not in self._market_meta:
                 return None
 
             asks_raw = data.get("asks") or data.get("ask") or []
             bids_raw = data.get("bids") or data.get("bid") or []
 
-            if isinstance(asks_raw, list):
-                asks = [(float(l.get("price", 0)), float(l.get("size", 0)))
-                        for l in asks_raw if l.get("price")]
-            else:
-                asks = []
-
-            if isinstance(bids_raw, list):
-                bids = [(float(l.get("price", 0)), float(l.get("size", 0)))
-                        for l in bids_raw if l.get("price")]
-            else:
-                bids = []
-
-            asks.sort(key=lambda x: x[0])
-            bids.sort(key=lambda x: -x[0])
+            asks = sorted(
+                [(float(l.get("price", 0)), float(l.get("size", 0)))
+                 for l in (asks_raw if isinstance(asks_raw, list) else [])
+                 if l.get("price")],
+                key=lambda x: x[0]
+            )
+            bids = sorted(
+                [(float(l.get("price", 0)), float(l.get("size", 0)))
+                 for l in (bids_raw if isinstance(bids_raw, list) else [])
+                 if l.get("price")],
+                key=lambda x: -x[0]
+            )
 
             best_ask = asks[0][0] if asks else 0.5
             best_bid = bids[0][0] if bids else 0.5
             yes_price = (best_ask + best_bid) / 2
 
-            return asset_id, {"asks": asks, "bids": bids, "yes_price": yes_price}
+            return str(asset_id), {"asks": asks, "bids": bids, "yes_price": yes_price}
         except Exception as e:
             log.debug("WS book parse error: %s", e)
             return None
+
+    async def _subscribe(self, ws):
+        """Try both known subscription message formats."""
+        token_ids = list(self._market_meta.keys())
+
+        # Format 1: documented in some Polymarket repos
+        await ws.send(json.dumps({"assets_ids": token_ids, "type": "Market"}))
+        # Format 2: recommendation uses this format
+        await ws.send(json.dumps({"type": "subscribe", "assets": token_ids}))
+
+        log.info("Polymarket WS subscribed (%d tokens) — waiting for messages…",
+                 len(token_ids))
+
+    async def _process_message(self, raw: str):
+        """Parse and dispatch a raw WS message."""
+        self._last_msg_time = time.time()
+
+        # Log raw payload once so we can see actual structure in logs
+        if not self._debug_logged:
+            log.debug("WS first message (raw): %s", raw[:500])
+            self._debug_logged = True
+
+        try:
+            msgs = json.loads(raw)
+        except json.JSONDecodeError:
+            if raw.strip():
+                log.debug("WS non-JSON: %s", raw[:100])
+            return
+
+        if not isinstance(msgs, list):
+            msgs = [msgs]
+
+        for msg in msgs:
+            if not isinstance(msg, dict):
+                continue
+            event_type = (msg.get("event_type") or msg.get("type") or
+                          msg.get("eventType") or "")
+            # Accept all known event types that carry book data
+            if event_type in ("book", "price_change", "last_trade_price",
+                              "update", "orderbook", "tick"):
+                result = self._parse_book(msg)
+                if result:
+                    token_id, book = result
+                    self._books[token_id] = book
+                    snap = self.get_snapshot(token_id)
+                    if snap:
+                        for cb in self._callbacks:
+                            asyncio.create_task(cb(snap))
+            elif event_type not in ("", "connected", "pong", "heartbeat"):
+                log.debug("WS unhandled event_type=%s keys=%s",
+                          event_type, list(msg.keys())[:6])
 
     async def run(self):
         self._running = True
@@ -997,53 +1068,37 @@ class PolymarketWSFeed:
             try:
                 async with websockets.connect(
                     CONFIG.poly_ws_url,
-                    ping_interval=30,
+                    ping_interval=20,
                     ping_timeout=10,
                     max_size=2**20,
+                    additional_headers={"User-Agent": "polymarket-arb-bot/1.0"},
                 ) as ws:
                     self._ws = ws
-                    # Subscribe to all active token IDs
-                    token_ids = list(self._market_meta.keys())
-                    sub_msg = json.dumps({"assets_ids": token_ids, "type": "Market"})
-                    await ws.send(sub_msg)
-                    log.info("Polymarket WS subscribed to %d tokens", len(token_ids))
+                    self._connected = True
+                    self._last_msg_time = time.time()
+                    self._debug_logged = False   # reset so we log the first msg
+                    await self._subscribe(ws)
 
                     async for raw in ws:
-                        try:
-                            msgs = json.loads(raw)
-                            if not isinstance(msgs, list):
-                                msgs = [msgs]
-                            for msg in msgs:
-                                event_type = msg.get("event_type") or msg.get("type", "")
-                                if event_type in ("book", "price_change", "last_trade_price"):
-                                    result = self._parse_book(msg)
-                                    if result:
-                                        token_id, book = result
-                                        self._books[token_id] = book
-                                        snap = self.get_snapshot(token_id)
-                                        if snap:
-                                            for cb in self._callbacks:
-                                                asyncio.create_task(cb(snap))
-                        except (json.JSONDecodeError, KeyError) as e:
-                            log.debug("WS parse error: %s", e)
+                        await self._process_message(raw)
 
             except (websockets.exceptions.ConnectionClosed,
                     websockets.exceptions.WebSocketException,
                     OSError) as e:
                 log.warning("Polymarket WS disconnected: %s – reconnecting in %ds",
                             e, CONFIG.ws_reconnect_delay)
+            except Exception as e:
+                log.error("Polymarket WS unexpected error: %s", e, exc_info=True)
+            finally:
                 self._ws = None
+                self._connected = False
                 await asyncio.sleep(CONFIG.ws_reconnect_delay)
 
     async def resubscribe(self, market_ids: dict[str, dict]):
-        """Called when market discovery finds new tokens — resubscribe."""
         self.set_markets(market_ids)
-        if self._ws:
+        if self._ws and self._connected:
             try:
-                token_ids = list(market_ids.keys())
-                sub_msg = json.dumps({"assets_ids": token_ids, "type": "Market"})
-                await self._ws.send(sub_msg)
-                log.info("Polymarket WS resubscribed to %d tokens", len(token_ids))
+                await self._subscribe(self._ws)
             except Exception as e:
                 log.warning("WS resubscribe failed: %s", e)
 
@@ -1670,11 +1725,11 @@ class ArbBot:
                     await self.poly_ws.resubscribe(self.poly_monitor.market_ids)
 
         tasks = [
-            asyncio.create_task(self.price_feed.run(),    name="binance_ws"),
-            asyncio.create_task(self.poly_ws.run(),       name="poly_ws"),
-            asyncio.create_task(self.poly_monitor.run(),  name="poly_rest"),
-            asyncio.create_task(_sync_ws_markets(),       name="ws_sync"),
-            asyncio.create_task(self._dashboard_loop(),   name="dashboard"),
+            asyncio.create_task(self.price_feed.run(),                        name="binance_ws"),
+            asyncio.create_task(self.poly_ws.run(),                           name="poly_ws"),
+            asyncio.create_task(self.poly_monitor.run(poly_ws=self.poly_ws),  name="poly_rest"),
+            asyncio.create_task(_sync_ws_markets(),                           name="ws_sync"),
+            asyncio.create_task(self._dashboard_loop(),                       name="dashboard"),
         ]
 
         try:
