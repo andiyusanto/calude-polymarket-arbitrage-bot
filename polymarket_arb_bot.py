@@ -75,26 +75,26 @@ class Config:
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # === TUNED TRADING PARAMETERS ===
-    min_edge_pct: float = 4.5           # More selective
-    lag_threshold_pct: float = 2.0
-    max_position_pct: float = 3.2
-    confidence_threshold: float = 59.0
-    kelly_fraction: float = 0.27
+    # Trading parameters - tuned for MORE FREQUENCY
+    min_edge_pct: float = 3.5           # Lowered → more trades
+    lag_threshold_pct: float = 1.6
+    max_position_pct: float = 4.0
+    confidence_threshold: float = 54.0  # Lowered → more signals
+    kelly_fraction: float = 0.32
 
     # Risk controls
-    kill_switch_drawdown: float = 10.0
-    max_daily_profit_pct: float = 80.0   # 50.0   # Safety cap
-    daily_profit_pause_hours: float = 6.0   # Pause duration after target hit
+    kill_switch_drawdown: float = 12.0
+    max_daily_profit_pct: float = 80.0
+    daily_profit_pause_hours: float = 6.0 
 
     # Fee & Slippage
     taker_fee_pct: float = 1.65
     simulated_slippage_pct: float = 0.5
-    fee_buffer_pct: float = 0.8
+    fee_buffer_pct: float = 0.7
 
     # Spike cooldown
     spike_threshold_pct: float = 0.35
-    spike_cooldown_sec: float = 20.0
+    spike_cooldown_sec: float = 18.0
 
     # Other
     db_path: str = "trades.db"
@@ -1242,25 +1242,24 @@ class SignalEngine:
 
     def _compute_fair_value(self, asset: str, direction: str, duration: str) -> tuple[float, float]:
         hist = self._price_history[asset]
-        if len(hist) < 50:
+        if len(hist) < 40:
             return 0.5, 0.0
 
         current = self.feed.prices.get(asset, 0)
         ofi = self.feed.ofi.get(asset, 0.5)
 
-        mom_short = (current - hist[-25]) / hist[-25] * 100 if hist[-25] > 0 else 0
-        mom_med   = (current - hist[-90]) / hist[-90] * 100 if len(hist) > 90 else mom_short
+        mom_short = (current - hist[-20]) / hist[-20] * 100 if hist[-20] > 0 else 0
+        mom_med   = (current - hist[-70]) / hist[-70] * 100 if len(hist) > 70 else mom_short
 
-        raw_prob = 0.5 + (mom_short * 0.019) + (mom_med * 0.011)
-        if ofi > 0.58: raw_prob += 0.04
-        elif ofi < 0.42: raw_prob -= 0.04
+        raw_prob = 0.5 + (mom_short * 0.021) + (mom_med * 0.013)
+        if ofi > 0.57: raw_prob += 0.038
+        elif ofi < 0.43: raw_prob -= 0.038
 
-        raw_prob = max(0.15, min(0.85, raw_prob))
+        raw_prob = max(0.12, min(0.88, raw_prob))
         fair_value = raw_prob if direction == "UP" else (1 - raw_prob)
 
-        # Confidence
-        mom_strength = min(abs(mom_short) / 1.5, 1.0) * 62
-        ofi_bonus = 24 if abs(ofi - 0.5) > 0.13 else 12
+        mom_strength = min(abs(mom_short) / 1.4, 1.0) * 58
+        ofi_bonus = 20 if abs(ofi - 0.5) > 0.11 else 10
         confidence = min(mom_strength + ofi_bonus, 100.0)
 
         return fair_value, confidence
@@ -1270,17 +1269,11 @@ class SignalEngine:
             snap.asset, snap.direction, snap.duration
         )
 
-        # Calculate edge
         edge = (fair_value - snap.yes_price) * 100 if snap.direction == "UP" else ((1 - fair_value) - snap.no_price) * 100
 
-        # Smart logging - only log strong or interesting signals
-        if confidence >= 50 or abs(edge) >= 4.0:
-            log.debug("Eval %s %s | Fair=%.4f | Poly=%.4f | Edge=%+.2f%% | Conf=%.1f%%",
-                      snap.asset, snap.direction, fair_value, snap.yes_price, edge, confidence)
-
-        if confidence >= CONFIG.confidence_threshold and abs(edge) >= CONFIG.min_edge_pct:
-            log.info("✅ STRONG SIGNAL → %s %s | Edge=%+.2f%% | Conf=%.1f%%",
-                     snap.asset, snap.direction, edge, confidence)
+        # Log strong signals only
+        if confidence >= CONFIG.confidence_threshold or abs(edge) >= 5.0:
+            log.debug(f"Eval {snap.asset} {snap.direction} | Fair={fair_value:.4f} | Poly={snap.yes_price:.4f} | Edge={edge:+.2f}% | Conf={confidence:.1f}%")
 
         if confidence < CONFIG.confidence_threshold:
             return None
