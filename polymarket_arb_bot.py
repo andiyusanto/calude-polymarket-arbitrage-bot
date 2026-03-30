@@ -58,8 +58,6 @@ console = Console()
 # ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
-@dataclass
-@dataclass
 class Config:
     # Polymarket
     polymarket_key: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
@@ -67,6 +65,11 @@ class Config:
     polymarket_secret: str = os.getenv("POLYMARKET_API_SECRET", "")
     polymarket_passphrase: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
     clob_host: str = "https://clob.polymarket.com"
+
+    # WebSocket URLs
+    poly_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"   # ← Added this
+    binance_ws_url: str = "wss://stream.binance.us:9443/stream"
+    binance_ws_fallback: str = "wss://data-stream.binance.com/stream"
 
     # Telegram
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -93,13 +96,11 @@ class Config:
     spike_cooldown_sec: float = 18.0
 
     # Other
-    binance_ws_url: str = "wss://stream.binance.us:9443/stream"
-    binance_ws_fallback: str = "wss://data-stream.binance.com/stream"
     db_path: str = "trades.db"
     order_cooldown_sec: float = 0.8
     ws_reconnect_delay: float = 5.0
     max_retries: int = 5
-    
+
 # class Config:
 #     # Polymarket
 #     polymarket_key: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
