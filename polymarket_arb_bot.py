@@ -70,13 +70,28 @@ class Config:
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # Trading parameters
-    min_edge_pct: float = 5.0          # Minimum edge to trade (%)
-    lag_threshold_pct: float = 3.0     # Polymarket lag vs CEX to flag (%)
-    max_position_pct: float = 8.0      # Max position as % of portfolio
-    confidence_threshold: float = 85.0 # Min confidence score to trade
-    kelly_fraction: float = 0.5        # Half-Kelly
-    kill_switch_drawdown: float = 20.0 # Daily drawdown % to halt all trading
-    max_slippage_pct: float = 1.5      # Max acceptable VWAP slippage vs best price (%)
+    min_edge_pct: float = 3.5           # Lowered — fee filter now handles the real floor
+    lag_threshold_pct: float = 3.0      # Polymarket lag vs CEX to flag (%)
+    max_position_pct: float = 8.0       # Max position as % of portfolio
+    confidence_threshold: float = 90.0  # Raised — fewer but higher-quality signals
+    kelly_fraction: float = 0.5         # Half-Kelly
+    kill_switch_drawdown: float = 20.0  # Daily drawdown % to halt all trading
+    max_slippage_pct: float = 1.5       # Max acceptable VWAP slippage vs best price (%)
+
+    # Fee-aware trading
+    # Polymarket taker fee is ~1.8% peak. Only trade if edge > fee + buffer.
+    # Set to 0 to disable (e.g. if you have a maker rebate).
+    taker_fee_pct: float = 1.8          # Current Polymarket peak taker fee (%)
+    fee_buffer_pct: float = 0.8         # Extra buffer above fee before trading
+    # Effective min edge = taker_fee_pct + fee_buffer_pct = 2.6% minimum net edge
+
+    # Post-spike cooldown: avoid trading N seconds after a violent CEX move
+    # Violent = BTC/ETH moves more than spike_threshold_pct in a single tick
+    spike_threshold_pct: float = 0.3    # % single-tick move that triggers cooldown
+    spike_cooldown_sec: float = 15.0    # Seconds to pause after a spike
+
+    # Polymarket WebSocket
+    poly_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
     # Binance WebSocket — use stream.binance.us if your server gets HTTP 451
     binance_ws_url: str = "wss://stream.binance.us:9443/stream"
@@ -412,11 +427,16 @@ class BinancePriceFeed:
     def __init__(self):
         self.prices: dict[str, float] = {"BTC": 0.0, "ETH": 0.0}
         self._prev: dict[str, float] = {"BTC": 0.0, "ETH": 0.0}
-        # Order flow imbalance: ratio of bid_vol / (bid_vol + ask_vol), 0-1
-        # 0.5 = neutral, >0.6 = buy pressure, <0.4 = sell pressure
         self.ofi: dict[str, float] = {"BTC": 0.5, "ETH": 0.5}
+        # Spike cooldown: timestamp of last violent move per asset
+        self.last_spike: dict[str, float] = {"BTC": 0.0, "ETH": 0.0}
         self._running = False
         self._callbacks: list = []
+
+    def is_in_cooldown(self, asset: str) -> bool:
+        """Returns True if we should skip trading due to a recent price spike."""
+        elapsed = time.time() - self.last_spike.get(asset, 0)
+        return elapsed < CONFIG.spike_cooldown_sec
 
     def on_update(self, cb):
         self._callbacks.append(cb)
@@ -482,6 +502,13 @@ class BinancePriceFeed:
                                 price=new_price,
                                 prev_price=self.prices[asset],
                             )
+                            # Spike detection: large single-tick move triggers cooldown
+                            if self.prices[asset] > 0:
+                                tick_chg = abs(new_price - self.prices[asset]) / self.prices[asset] * 100
+                                if tick_chg >= CONFIG.spike_threshold_pct:
+                                    self.last_spike[asset] = time.time()
+                                    log.debug("Spike detected %s: %.3f%% — cooldown %ds",
+                                              asset, tick_chg, CONFIG.spike_cooldown_sec)
                             self._prev[asset] = self.prices[asset]
                             self.prices[asset] = new_price
                             for cb in self._callbacks:
@@ -569,7 +596,16 @@ class PolymarketMonitor:
         ASSET_KEYWORDS = {
             "BTC": ["btc", "bitcoin"],
             "ETH": ["eth", "ethereum", "ether"],
+            # Only BTC and ETH — signal engine prices these from Binance.
+            # Altcoins (SOL, XRP, BNB, DOGE, HYPE etc.) are intentionally excluded.
         }
+        # Skip if question contains any of these — altcoins and non-price markets
+        SKIP_KEYWORDS = [
+            "solana", "xrp", "ripple", "bnb", "dogecoin", "doge",
+            "hyperliquid", "avax", "avalanche", "matic", "polygon",
+            "ada", "cardano", "link", "chainlink", "map 1", "map 2",
+            "kills", "odd/even", "esport", "sol up", "sol down",
+        ]
         # Polymarket 5M/15M canonical patterns seen in production:
         #   "bitcoin up or down - march 29, 5:15am-5:20am et"
         #   "bitcoin up or down on march 29?"
@@ -660,9 +696,13 @@ class PolymarketMonitor:
                             if not question:
                                 continue
 
+                            # ── Skip altcoins and non-price markets ────────
+                            if any(skip in question for skip in SKIP_KEYWORDS):
+                                continue
+
                             log.debug("CANDIDATE: %s", question)
 
-                            # ── Asset match ────────────────────────────────
+                            # ── Asset match (BTC/ETH only) ─────────────────
                             asset = None
                             for a, kws in ASSET_KEYWORDS.items():
                                 if any(k in question for k in kws):
@@ -699,6 +739,10 @@ class PolymarketMonitor:
                                     outcomes = []
 
                             for i, token_id in enumerate(clob_token_ids):
+                                tid = str(token_id)
+                                if tid in found:
+                                    continue  # already discovered, skip duplicate
+
                                 outcome = str(outcomes[i]).lower() if i < len(outcomes) else ""
                                 if any(k in outcome for k in ["up", "higher", "yes", "above"]):
                                     direction = "UP"
@@ -707,7 +751,7 @@ class PolymarketMonitor:
                                 else:
                                     direction = "UP" if i == 0 else "DOWN"
 
-                                found[str(token_id)] = {
+                                found[tid] = {
                                     "asset":     asset,
                                     "direction": direction,
                                     "duration":  duration,
@@ -715,7 +759,7 @@ class PolymarketMonitor:
                                 }
                                 log.info(
                                     "Discovered: %s → %s %s %s  outcome=%s  (q: %.55s)",
-                                    str(token_id)[:14], asset, direction, duration,
+                                    tid[:14], asset, direction, duration,
                                     outcomes[i] if i < len(outcomes) else "?",
                                     question,
                                 )
@@ -847,8 +891,145 @@ class PolymarketMonitor:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Signal engine
+# Polymarket WebSocket order book feed
 # ═══════════════════════════════════════════════════════════════════════════
+
+class PolymarketWSFeed:
+    """
+    Subscribes to Polymarket's CLOB WebSocket market channel for real-time
+    order book updates. Replaces REST polling for active tokens.
+
+    Protocol:
+      Connect → send {"assets_ids": [...], "type": "Market"}
+      Receive book_update and price_change events
+    """
+
+    def __init__(self):
+        self._books: dict[str, dict] = {}   # token_id → {asks, bids, yes_price}
+        self._callbacks: list = []
+        self._market_meta: dict[str, dict] = {}  # token_id → {asset, direction, duration}
+        self._running = False
+        self._ws = None
+
+    def on_snapshot(self, cb):
+        self._callbacks.append(cb)
+
+    def set_markets(self, market_ids: dict[str, dict]):
+        """Update the set of token IDs to subscribe to."""
+        self._market_meta = market_ids
+
+    def get_snapshot(self, market_id: str) -> Optional[MarketSnapshot]:
+        book = self._books.get(market_id)
+        meta = self._market_meta.get(market_id)
+        if not book or not meta:
+            return None
+        return MarketSnapshot(
+            market_id=market_id,
+            asset=meta["asset"],
+            direction=meta["direction"],
+            duration=meta["duration"],
+            yes_price=book.get("yes_price", 0.5),
+            no_price=1.0 - book.get("yes_price", 0.5),
+            asks=book.get("asks", []),
+            bids=book.get("bids", []),
+        )
+
+    def _parse_book(self, data: dict) -> Optional[tuple[str, dict]]:
+        """Parse a book_update or price_change message into (token_id, book_dict)."""
+        try:
+            asset_id = data.get("asset_id") or data.get("market")
+            if not asset_id:
+                return None
+
+            asks_raw = data.get("asks") or data.get("ask") or []
+            bids_raw = data.get("bids") or data.get("bid") or []
+
+            if isinstance(asks_raw, list):
+                asks = [(float(l.get("price", 0)), float(l.get("size", 0)))
+                        for l in asks_raw if l.get("price")]
+            else:
+                asks = []
+
+            if isinstance(bids_raw, list):
+                bids = [(float(l.get("price", 0)), float(l.get("size", 0)))
+                        for l in bids_raw if l.get("price")]
+            else:
+                bids = []
+
+            asks.sort(key=lambda x: x[0])
+            bids.sort(key=lambda x: -x[0])
+
+            best_ask = asks[0][0] if asks else 0.5
+            best_bid = bids[0][0] if bids else 0.5
+            yes_price = (best_ask + best_bid) / 2
+
+            return asset_id, {"asks": asks, "bids": bids, "yes_price": yes_price}
+        except Exception as e:
+            log.debug("WS book parse error: %s", e)
+            return None
+
+    async def run(self):
+        self._running = True
+        while self._running:
+            if not self._market_meta:
+                await asyncio.sleep(1)
+                continue
+            try:
+                async with websockets.connect(
+                    CONFIG.poly_ws_url,
+                    ping_interval=30,
+                    ping_timeout=10,
+                    max_size=2**20,
+                ) as ws:
+                    self._ws = ws
+                    # Subscribe to all active token IDs
+                    token_ids = list(self._market_meta.keys())
+                    sub_msg = json.dumps({"assets_ids": token_ids, "type": "Market"})
+                    await ws.send(sub_msg)
+                    log.info("Polymarket WS subscribed to %d tokens", len(token_ids))
+
+                    async for raw in ws:
+                        try:
+                            msgs = json.loads(raw)
+                            if not isinstance(msgs, list):
+                                msgs = [msgs]
+                            for msg in msgs:
+                                event_type = msg.get("event_type") or msg.get("type", "")
+                                if event_type in ("book", "price_change", "last_trade_price"):
+                                    result = self._parse_book(msg)
+                                    if result:
+                                        token_id, book = result
+                                        self._books[token_id] = book
+                                        snap = self.get_snapshot(token_id)
+                                        if snap:
+                                            for cb in self._callbacks:
+                                                asyncio.create_task(cb(snap))
+                        except (json.JSONDecodeError, KeyError) as e:
+                            log.debug("WS parse error: %s", e)
+
+            except (websockets.exceptions.ConnectionClosed,
+                    websockets.exceptions.WebSocketException,
+                    OSError) as e:
+                log.warning("Polymarket WS disconnected: %s – reconnecting in %ds",
+                            e, CONFIG.ws_reconnect_delay)
+                self._ws = None
+                await asyncio.sleep(CONFIG.ws_reconnect_delay)
+
+    async def resubscribe(self, market_ids: dict[str, dict]):
+        """Called when market discovery finds new tokens — resubscribe."""
+        self.set_markets(market_ids)
+        if self._ws:
+            try:
+                token_ids = list(market_ids.keys())
+                sub_msg = json.dumps({"assets_ids": token_ids, "type": "Market"})
+                await self._ws.send(sub_msg)
+                log.info("Polymarket WS resubscribed to %d tokens", len(token_ids))
+            except Exception as e:
+                log.warning("WS resubscribe failed: %s", e)
+
+    def stop(self):
+        self._running = False
+
 
 class SignalEngine:
     """
@@ -1346,6 +1527,7 @@ class ArbBot:
         self.db = Database(CONFIG.db_path)
         self.price_feed = BinancePriceFeed()
         self.poly_monitor = PolymarketMonitor()
+        self.poly_ws = PolymarketWSFeed()        # WebSocket book feed (primary)
         self.signal_engine = SignalEngine(self.price_feed)
         self.sizer = KellySizer(portfolio_value)
         self.executor = OrderExecutor(live=live)
@@ -1380,6 +1562,22 @@ class ArbBot:
 
         sig = self.signal_engine.evaluate(snap)
         if sig is None:
+            return
+
+        # ── Spike cooldown ──────────────────────────────────────────────────
+        if self.price_feed.is_in_cooldown(sig.asset):
+            log.debug("COOLDOWN %s – skipping signal after spike", sig.asset)
+            return
+
+        # ── Fee-aware edge filter ───────────────────────────────────────────
+        # Net edge must exceed taker fee + buffer to be worth trading.
+        # This replaces the raw min_edge_pct check — we still keep min_edge_pct
+        # as a secondary floor for very low-fee scenarios.
+        net_edge_floor = CONFIG.taker_fee_pct + CONFIG.fee_buffer_pct
+        effective_min  = max(CONFIG.min_edge_pct, net_edge_floor)
+        if sig.edge_pct < effective_min:
+            log.debug("EDGE BELOW FEE FLOOR %.1f%% (need %.1f%%): %s %s",
+                      sig.edge_pct, effective_min, sig.asset, sig.direction)
             return
 
         size = self.sizer.size(sig)
@@ -1435,19 +1633,28 @@ class ArbBot:
     async def run(self):
         mode_str = "LIVE TRADING" if self.live else "PAPER TRADING"
         log.info("Starting Polymarket Arb Bot in %s mode", mode_str)
-
         if self.live:
             log.warning("⚠️  LIVE TRADING ENABLED – real funds at risk")
 
-        # Wire callbacks
+        # Wire callbacks — WS feed is primary, REST monitor is fallback/discovery
         self.price_feed.on_update(self._on_price_update)
-        self.poly_monitor.on_snapshot(self._on_market_snapshot)
+        self.poly_ws.on_snapshot(self._on_market_snapshot)    # WS = primary
+        self.poly_monitor.on_snapshot(self._on_market_snapshot)  # REST = fallback
 
-        # Start tasks
+        # After discovery, sync market meta to WS feed
+        async def _sync_ws_markets():
+            while True:
+                await asyncio.sleep(10)
+                if self.poly_monitor.market_ids:
+                    self.poly_ws.set_markets(self.poly_monitor.market_ids)
+                    await self.poly_ws.resubscribe(self.poly_monitor.market_ids)
+
         tasks = [
-            asyncio.create_task(self.price_feed.run(), name="binance_ws"),
-            asyncio.create_task(self.poly_monitor.run(), name="poly_monitor"),
-            asyncio.create_task(self._dashboard_loop(), name="dashboard"),
+            asyncio.create_task(self.price_feed.run(),    name="binance_ws"),
+            asyncio.create_task(self.poly_ws.run(),       name="poly_ws"),
+            asyncio.create_task(self.poly_monitor.run(),  name="poly_rest"),
+            asyncio.create_task(_sync_ws_markets(),       name="ws_sync"),
+            asyncio.create_task(self._dashboard_loop(),   name="dashboard"),
         ]
 
         try:
@@ -1457,6 +1664,7 @@ class ArbBot:
         finally:
             self.price_feed.stop()
             self.poly_monitor.stop()
+            self.poly_ws.stop()
             await self.notifier.close()
 
     async def _dashboard_loop(self):
