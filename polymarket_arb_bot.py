@@ -685,8 +685,8 @@ class PolymarketMonitor:
                                         end_date_str.replace("Z", "+00:00")
                                     )
                                     end_ts = end_dt.timestamp()
-                                    if end_ts < now + 60:
-                                        continue   # expires too soon
+                                    if end_ts < now + 120:   # need at least 2 min remaining
+                                        continue
                                     # Also cap at 20 minutes — beyond that it's not a 5M/15M
                                     if end_ts > now + 1200:
                                         continue
@@ -1047,6 +1047,12 @@ class PolymarketWSFeed:
 
             yes_price = (bids[0][0] + asks[0][0]) / 2
 
+            # Skip contracts that are already near resolution (price outside 0.10–0.90)
+            # These are expired/almost-expired and have no trading value
+            if yes_price < 0.10 or yes_price > 0.90:
+                log.debug("WS skip near-resolved %s @ %.4f", asset_id[:12], yes_price)
+                return
+
             snap = MarketSnapshot(
                 market_id=asset_id,
                 asset=meta["asset"],
@@ -1139,7 +1145,8 @@ class PolymarketWSFeed:
 
             # Book data arrives under several event type names
             if msg_type in ("book", "price_change", "last_trade_price",
-                            "update", "orderbook", "tick", "market"):
+                            "update", "orderbook", "tick", "market",
+                            "best_bid_ask"):   # ← primary real-time feed from Polymarket
                 await self._process_ws_update(msg)
             else:
                 log.debug("WS unhandled type=%s keys=%s", msg_type,
