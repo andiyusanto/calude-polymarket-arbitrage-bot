@@ -1804,19 +1804,49 @@ class ArbBot:
 
                 # Simulate close for paper trades and update market stats
                 if pos.status == "PAPER":
-                    # Realistic paper P&L:
-                    # Win: receive $1 per token, paid entry_price + fee + slippage
-                    # Loss: token expires worthless, lose entry_price + fee + slippage
+                    # # Realistic paper P&L:
+                    # # Win: receive $1 per token, paid entry_price + fee + slippage
+                    # # Loss: token expires worthless, lose entry_price + fee + slippage
+                    # fee_cost = pos.entry_price * (CONFIG.taker_fee_pct / 100)
+                    # slip_cost = pos.entry_price * (CONFIG.simulated_slippage_pct / 100)
+                    # total_cost_per_token = pos.entry_price + fee_cost + slip_cost
+
+                    # # fair_value is our estimate of true probability of winning
+                    # # Expected P&L = prob_win * (1 - total_cost) - prob_loss * total_cost
+                    # prob_win = sig.fair_value if sig.side == "YES" else (1 - sig.fair_value)
+                    # gross_pnl = (prob_win * (1.0 - total_cost_per_token)
+                    #              - (1 - prob_win) * total_cost_per_token) * size
+                    # pnl = round(gross_pnl, 4)
+
+                    # self.db.update_trade(pos.trade_id, "CLOSED", pnl, time.time())
+                    # self.db.update_market_stats(
+                    #     pos.market_id, pos.asset, pos.direction, snap.duration, pnl
+                    # )
+                    # self.sizer.record_result(pnl > 0)
+                    # pos.pnl = pnl
+                    # pos.status = "CLOSED"
+                    
+                    # Calculate total cost per token
                     fee_cost = pos.entry_price * (CONFIG.taker_fee_pct / 100)
                     slip_cost = pos.entry_price * (CONFIG.simulated_slippage_pct / 100)
                     total_cost_per_token = pos.entry_price + fee_cost + slip_cost
 
-                    # fair_value is our estimate of true probability of winning
-                    # Expected P&L = prob_win * (1 - total_cost) - prob_loss * total_cost
+                    # For realistic simulation: randomly resolve based on true probability
+                    # In production paper mode, you should use actual resolution later
+                    # For now, we use fair_value as proxy probability
+                    import random
+                    
                     prob_win = sig.fair_value if sig.side == "YES" else (1 - sig.fair_value)
-                    gross_pnl = (prob_win * (1.0 - total_cost_per_token)
-                                 - (1 - prob_win) * total_cost_per_token) * size
-                    pnl = round(gross_pnl, 4)
+                    
+                    # Simulate actual outcome
+                    if random.random() < prob_win:
+                        # Win: receive $1 per token
+                        pnl = (1.0 - total_cost_per_token) * size
+                    else:
+                        # Loss: token expires worthless
+                        pnl = -total_cost_per_token * size
+                    
+                    pnl = round(pnl, 4)
 
                     self.db.update_trade(pos.trade_id, "CLOSED", pnl, time.time())
                     self.db.update_market_stats(
