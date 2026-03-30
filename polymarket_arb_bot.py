@@ -940,6 +940,7 @@ class PolymarketWSFeed:
 
     def __init__(self):
         self._books: dict[str, dict] = {}
+        self.snapshots: dict[str, MarketSnapshot] = {}   # mirrors PolymarketMonitor.snapshots
         self._callbacks: list = []
         self._market_meta: dict[str, dict] = {}
         self._running = False
@@ -1001,41 +1002,76 @@ class PolymarketWSFeed:
         return [x for x in parsed if x is not None]
 
     async def _process_ws_update(self, data: dict):
-        """Parse a single order book update message into a MarketSnapshot."""
+        """
+        Parse Polymarket WS update into a MarketSnapshot.
+
+        Polymarket sends best_bid / best_ask as top-level fields for speed.
+        Full bids/asks arrays are also included when present — we use them
+        for the slippage guard. When only best prices are available we
+        construct a single-level synthetic book with a realistic size cap
+        so the slippage guard doesn't assume infinite liquidity.
+        """
         try:
-            market_id = (data.get("market") or data.get("asset_id") or
-                         data.get("asset") or data.get("token_id"))
-            if not market_id or str(market_id) not in self._market_meta:
+            asset_id = (data.get("asset_id") or data.get("market") or
+                        data.get("asset") or data.get("token_id"))
+            if not asset_id:
+                return
+            asset_id = str(asset_id)
+            if asset_id not in self._market_meta:
                 return
 
-            market_id = str(market_id)
-            bids_raw = data.get("bids") or data.get("bid") or []
-            asks_raw = data.get("asks") or data.get("ask") or []
+            meta = self._market_meta[asset_id]
 
-            bids = sorted(self._parse_levels(bids_raw), key=lambda x: -x[0])
-            asks = sorted(self._parse_levels(asks_raw), key=lambda x:  x[0])
+            # ── Best bid/ask (fast path — always present) ──────────────────
+            best_bid_raw = data.get("best_bid") or data.get("bid") or 0
+            best_ask_raw = data.get("best_ask") or data.get("ask") or 0
+            best_bid = float(best_bid_raw) if best_bid_raw else 0.0
+            best_ask = float(best_ask_raw) if best_ask_raw else 0.0
 
-            if not bids and not asks:
-                return  # empty book — skip
+            # ── Full order book levels (when present, use them) ─────────────
+            bids = self._parse_levels(data.get("bids") or data.get("bid_levels") or [])
+            asks = self._parse_levels(data.get("asks") or data.get("ask_levels") or [])
 
-            best_bid = bids[0][0] if bids else 0.5
-            best_ask = asks[0][0] if asks else 0.5
-            yes_price = (best_bid + best_ask) / 2
+            # If full levels missing, build minimal synthetic book from best prices
+            # Use a realistic synthetic size ($50) not 1000 — avoids fooling slippage guard
+            if not bids and best_bid > 0:
+                bids = [(best_bid, 50.0)]
+            if not asks and best_ask > 0:
+                asks = [(best_ask, 50.0)]
 
-            book = {
-                "bids":      bids[:10],
-                "asks":      asks[:10],
-                "yes_price": yes_price,
+            if not bids or not asks:
+                return
+
+            bids = sorted(bids, key=lambda x: -x[0])
+            asks = sorted(asks, key=lambda x:  x[0])
+
+            yes_price = (bids[0][0] + asks[0][0]) / 2
+
+            snap = MarketSnapshot(
+                market_id=asset_id,
+                asset=meta["asset"],
+                direction=meta["direction"],
+                duration=meta["duration"],
+                yes_price=yes_price,
+                no_price=1.0 - yes_price,
+                bids=bids[:10],
+                asks=asks[:10],
+            )
+
+            self._books[asset_id] = {
+                "bids": bids[:10], "asks": asks[:10], "yes_price": yes_price
             }
-            self._books[market_id] = book
+            self.snapshots[asset_id] = snap
 
-            snap = self.get_snapshot(market_id)
-            if snap:
-                for cb in self._callbacks:
-                    asyncio.create_task(cb(snap))
+            for cb in self._callbacks:
+                asyncio.create_task(cb(snap))
+
+            log.debug("WS snap %s %s %s @ %.4f",
+                      meta["asset"], meta["direction"], asset_id[:12], yes_price)
 
         except Exception as e:
-            log.debug("WS update processing error: %s", e)
+            log.debug("WS parse failed: %s — data keys: %s", e,
+                      list(data.keys())[:6] if isinstance(data, dict) else type(data))
 
     async def _subscribe(self, ws):
         """Subscribe using the correct Polymarket WS protocol format."""
