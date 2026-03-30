@@ -71,10 +71,10 @@ class Config:
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # Trading parameters
-    min_edge_pct: float = 2.0           #3.5           # Lowered — fee filter now handles the real floor
-    lag_threshold_pct: float =  1.0     #3.0      # Polymarket lag vs CEX to flag (%)
+    min_edge_pct: float = 2.0           # 3.5           # Lowered — fee filter now handles the real floor
+    lag_threshold_pct: float =  1.0     # 3.0      # Polymarket lag vs CEX to flag (%)
     max_position_pct: float = 8.0       # Max position as % of portfolio
-    confidence_threshold: float = 65.0  #90.0  # Raised — fewer but higher-quality signals
+    confidence_threshold: float = 45.0  # 65.0  #90.0  # Raised — fewer but higher-quality signals
     kelly_fraction: float = 0.5         # Half-Kelly
     kill_switch_drawdown: float = 20.0  # Daily drawdown % to halt all trading
     max_slippage_pct: float = 1.5       # Max acceptable VWAP slippage vs best price (%)
