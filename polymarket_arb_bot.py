@@ -1722,18 +1722,9 @@ class ArbBot:
                     await self.notifier.send(f"*{msg}*")
                 return   # Skip trading during pause
 
-            # Skip if in spike cooldown
-            if hasattr(self, 'spike_cooldown') and self.spike_cooldown.is_in_cooldown():
-                return
-            
-            if daily_pnl_pct >= CONFIG.max_daily_profit_pct:
-                if not self.kill_switch:
-                    self.kill_switch = True
-                    self.dashboard.kill_switch_active = True
-                    msg = f"🏁 DAILY PROFIT TARGET HIT +{daily_pnl_pct:.1f}% — trading paused"
-                    log.info(msg)
-                    await self.notifier.send(f"*{msg}*")
-                return
+        # Skip if in spike cooldown
+        if hasattr(self, 'spike_cooldown') and self.spike_cooldown.is_in_cooldown():
+            return        
 
         sig = self.signal_engine.evaluate(snap)
         if sig is None:
