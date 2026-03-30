@@ -1325,6 +1325,16 @@ class SignalEngine:
             snap.asset, snap.direction, snap.duration
         )
 
+        edge = (fair_value - snap.yes_price) * 100 if snap.direction == "UP" else ((1 - fair_value) - snap.no_price) * 100
+    
+        log.debug(f"Eval {snap.asset} {snap.direction} | "
+              f"Fair={fair_value:.4f} | Poly={snap.yes_price:.4f} | "
+              f"Edge={edge:+.2f}% | Conf={confidence:.1f}%")
+        
+        if confidence >= CONFIG.confidence_threshold:   # temporary debug line
+            log.info(f"STRONG EDGE → {snap.asset} {snap.direction} | Edge={edge:+.2f}% | Conf={confidence:.1f}%")
+
+
         if confidence < CONFIG.confidence_threshold:
             return None
 
