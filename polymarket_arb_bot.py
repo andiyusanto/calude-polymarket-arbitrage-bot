@@ -1047,9 +1047,9 @@ class PolymarketWSFeed:
 
             yes_price = (bids[0][0] + asks[0][0]) / 2
 
-            # Skip contracts that are already near resolution (price outside 0.10–0.90)
+            # Skip contracts that are already near resolution (price outside 0.15–0.85)
             # These are expired/almost-expired and have no trading value
-            if yes_price < 0.10 or yes_price > 0.90:
+            if yes_price < 0.15 or yes_price > 0.85:
                 log.debug("WS skip near-resolved %s @ %.4f", asset_id[:12], yes_price)
                 return
 
@@ -1148,6 +1148,13 @@ class PolymarketWSFeed:
                             "update", "orderbook", "tick", "market",
                             "best_bid_ask"):   # ← primary real-time feed from Polymarket
                 await self._process_ws_update(msg)
+
+            elif msg_type == "price_changes":
+                # Batch format: {"type":"price_changes", "price_changes":[{asset_id, best_bid, best_ask}, ...]}
+                changes = msg.get("price_changes") or []
+                for change in changes:
+                    if isinstance(change, dict):
+                        await self._process_ws_update(change)
             else:
                 log.debug("WS unhandled type=%s keys=%s", msg_type,
                           list(msg.keys())[:6])
