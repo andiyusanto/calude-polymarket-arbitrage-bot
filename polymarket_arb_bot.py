@@ -1826,33 +1826,30 @@ class ArbBot:
                     # pos.pnl = pnl
                     # pos.status = "CLOSED"
                     
-                    # Calculate total cost per token
-                    fee_cost = pos.entry_price * (CONFIG.taker_fee_pct / 100)
-                    slip_cost = pos.entry_price * (CONFIG.simulated_slippage_pct / 100)
+                    # Calculate real cost per token
+                    fee_cost = pos.entry_price * (CONFIG.taker_fee_pct / 100.0)
+                    slip_cost = pos.entry_price * (CONFIG.simulated_slippage_pct / 100.0)
                     total_cost_per_token = pos.entry_price + fee_cost + slip_cost
 
-                    # For realistic simulation: randomly resolve based on true probability
-                    # In production paper mode, you should use actual resolution later
-                    # For now, we use fair_value as proxy probability
-                    import random
-                    
+                    # Probability of winning based on our fair value
                     prob_win = sig.fair_value if sig.side == "YES" else (1 - sig.fair_value)
-                    
+
                     # Simulate actual outcome
+                    import random
                     if random.random() < prob_win:
-                        # Win: receive $1 per token
-                        pnl = (1.0 - total_cost_per_token) * size
+                        pnl = (1.0 - total_cost_per_token) * pos.size_usdc      # Win
                     else:
-                        # Loss: token expires worthless
-                        pnl = -total_cost_per_token * size
-                    
+                        pnl = -total_cost_per_token * pos.size_usdc             # Loss
+
                     pnl = round(pnl, 4)
 
+                    # Update database and stats
                     self.db.update_trade(pos.trade_id, "CLOSED", pnl, time.time())
                     self.db.update_market_stats(
                         pos.market_id, pos.asset, pos.direction, snap.duration, pnl
                     )
                     self.sizer.record_result(pnl > 0)
+                    
                     pos.pnl = pnl
                     pos.status = "CLOSED"
                     log.info("[PAPER P&L] %s %s edge=%.1f%% fee=%.2f%% slip=%.2f%% → $%.4f",
