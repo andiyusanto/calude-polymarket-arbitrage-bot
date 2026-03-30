@@ -1810,13 +1810,18 @@ class ArbBot:
         self.poly_ws.on_snapshot(self._on_market_snapshot)    # WS = primary
         self.poly_monitor.on_snapshot(self._on_market_snapshot)  # REST = fallback
 
-        # After discovery, sync market meta to WS feed
+        # After discovery, sync market meta to WS feed only when markets change
         async def _sync_ws_markets():
+            last_market_ids: set = set()
             while True:
                 await asyncio.sleep(10)
-                if self.poly_monitor.market_ids:
+                current_ids = set(self.poly_monitor.market_ids.keys())
+                if current_ids and current_ids != last_market_ids:
+                    log.info("Market IDs changed (%d → %d) — resyncing WS",
+                             len(last_market_ids), len(current_ids))
                     self.poly_ws.set_markets(self.poly_monitor.market_ids)
                     await self.poly_ws.resubscribe(self.poly_monitor.market_ids)
+                    last_market_ids = current_ids
 
         tasks = [
             asyncio.create_task(self.price_feed.run(),                        name="binance_ws"),
