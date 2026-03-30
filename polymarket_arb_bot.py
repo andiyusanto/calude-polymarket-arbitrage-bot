@@ -66,8 +66,8 @@ class Config:
     polymarket_passphrase: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
     clob_host: str = "https://clob.polymarket.com"
 
-    # WebSocket URLs
-    poly_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"   # ← Added this
+    # WebSocket
+    poly_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     binance_ws_url: str = "wss://stream.binance.us:9443/stream"
     binance_ws_fallback: str = "wss://data-stream.binance.com/stream"
 
@@ -75,25 +75,25 @@ class Config:
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # Trading parameters
-    min_edge_pct: float = 4.2
+    # === TUNED TRADING PARAMETERS ===
+    min_edge_pct: float = 4.5           # More selective
     lag_threshold_pct: float = 2.0
-    max_position_pct: float = 3.5
-    confidence_threshold: float = 58.0
-    kelly_fraction: float = 0.28
+    max_position_pct: float = 3.2
+    confidence_threshold: float = 59.0
+    kelly_fraction: float = 0.27
 
     # Risk controls
     kill_switch_drawdown: float = 10.0
-    max_daily_profit_pct: float = 60.0
+    max_daily_profit_pct: float = 50.0   # Safety cap
 
     # Fee & Slippage
     taker_fee_pct: float = 1.65
     simulated_slippage_pct: float = 0.5
-    fee_buffer_pct: float = 0.7
+    fee_buffer_pct: float = 0.8
 
     # Spike cooldown
     spike_threshold_pct: float = 0.35
-    spike_cooldown_sec: float = 18.0
+    spike_cooldown_sec: float = 20.0
 
     # Other
     db_path: str = "trades.db"
@@ -1225,33 +1225,30 @@ class SignalEngine:
     def record_price(self, asset: str, price: float):
         hist = self._price_history[asset]
         hist.append(price)
-        if len(hist) > 1500:
+        if len(hist) > 1800:
             hist.pop(0)
 
     def _compute_fair_value(self, asset: str, direction: str, duration: str) -> tuple[float, float]:
         hist = self._price_history[asset]
-        if len(hist) < 40:
+        if len(hist) < 50:
             return 0.5, 0.0
 
         current = self.feed.prices.get(asset, 0)
         ofi = self.feed.ofi.get(asset, 0.5)
 
-        mom_short = (current - hist[-20]) / hist[-20] * 100 if hist[-20] > 0 else 0
-        mom_med   = (current - hist[-80]) / hist[-80] * 100 if len(hist) > 80 else mom_short
+        mom_short = (current - hist[-25]) / hist[-25] * 100 if hist[-25] > 0 else 0
+        mom_med   = (current - hist[-90]) / hist[-90] * 100 if len(hist) > 90 else mom_short
 
-        # Combined momentum + OFI
-        raw_prob = 0.5 + (mom_short * 0.022) + (mom_med * 0.012)
-        if ofi > 0.57:
-            raw_prob += 0.035
-        elif ofi < 0.43:
-            raw_prob -= 0.035
+        raw_prob = 0.5 + (mom_short * 0.019) + (mom_med * 0.011)
+        if ofi > 0.58: raw_prob += 0.04
+        elif ofi < 0.42: raw_prob -= 0.04
 
-        raw_prob = max(0.12, min(0.88, raw_prob))
+        raw_prob = max(0.15, min(0.85, raw_prob))
         fair_value = raw_prob if direction == "UP" else (1 - raw_prob)
 
-        # Confidence score
-        mom_strength = min(abs(mom_short) / 1.6, 1.0) * 58
-        ofi_bonus = 22 if abs(ofi - 0.5) > 0.12 else 10
+        # Confidence
+        mom_strength = min(abs(mom_short) / 1.5, 1.0) * 62
+        ofi_bonus = 24 if abs(ofi - 0.5) > 0.13 else 12
         confidence = min(mom_strength + ofi_bonus, 100.0)
 
         return fair_value, confidence
@@ -1261,14 +1258,17 @@ class SignalEngine:
             snap.asset, snap.direction, snap.duration
         )
 
-        edge_debug = (fair_value - snap.yes_price) * 100 if snap.direction == "UP" else ((1 - fair_value) - snap.no_price) * 100
-        log.debug("Eval %s %s | Fair=%.4f | Poly=%.4f | Edge=%+.2f%% | Conf=%.1f%%",
-                  snap.asset, snap.direction, fair_value, snap.yes_price,
-                  edge_debug, confidence)
-        if confidence >= CONFIG.confidence_threshold:
-            log.info("STRONG SIGNAL → %s %s | Edge=%+.2f%% | Conf=%.1f%%",
-                     snap.asset, snap.direction, edge_debug, confidence)
+        # Calculate edge
+        edge = (fair_value - snap.yes_price) * 100 if snap.direction == "UP" else ((1 - fair_value) - snap.no_price) * 100
 
+        # Smart logging - only log strong or interesting signals
+        if confidence >= 50 or abs(edge) >= 4.0:
+            log.debug("Eval %s %s | Fair=%.4f | Poly=%.4f | Edge=%+.2f%% | Conf=%.1f%%",
+                      snap.asset, snap.direction, fair_value, snap.yes_price, edge, confidence)
+
+        if confidence >= CONFIG.confidence_threshold and abs(edge) >= CONFIG.min_edge_pct:
+            log.info("✅ STRONG SIGNAL → %s %s | Edge=%+.2f%% | Conf=%.1f%%",
+                     snap.asset, snap.direction, edge, confidence)
 
         if confidence < CONFIG.confidence_threshold:
             return None
@@ -1277,9 +1277,9 @@ class SignalEngine:
         no_edge  = ((1 - fair_value) - snap.no_price) * 100
 
         if yes_edge >= CONFIG.min_edge_pct and yes_edge > no_edge:
-            side, poly_price, edge = "YES", snap.yes_price, yes_edge
+            side, poly_price, edge_val = "YES", snap.yes_price, yes_edge
         elif no_edge >= CONFIG.min_edge_pct:
-            side, poly_price, edge = "NO", snap.no_price, no_edge
+            side, poly_price, edge_val = "NO", snap.no_price, no_edge
         else:
             return None
 
@@ -1291,7 +1291,7 @@ class SignalEngine:
             side=side,
             poly_price=poly_price,
             fair_value=fair_value,
-            edge_pct=edge,
+            edge_pct=edge_val,
             confidence=confidence,
             kelly_size=0.0,
         )
