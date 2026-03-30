@@ -100,71 +100,9 @@ class Config:
     order_cooldown_sec: float = 0.8
     ws_reconnect_delay: float = 5.0
     max_retries: int = 5
+    max_slippage_pct: float = 1.5      # Max acceptable VWAP slippage vs best price (%)
 
-# class Config:
-#     # Polymarket
-#     polymarket_key: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
-#     polymarket_api_key: str = os.getenv("POLYMARKET_API_KEY", "")
-#     polymarket_secret: str = os.getenv("POLYMARKET_API_SECRET", "")
-#     polymarket_passphrase: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
-#     clob_host: str = "https://clob.polymarket.com"
-
-#     # Telegram
-#     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-#     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
-
-#     # ── Trading parameters ─────────────────────────────────────────────────
-#     # min_edge_pct: lowered to 3.0 (your 2.0 is too thin vs 1.65% avg fee).
-#     # With taker_fee_pct=1.65 + fee_buffer=0.6, effective floor = 2.25% net.
-#     # 3.0 gives ~1.35% net edge after fees — worth trading.
-#     # min_edge_pct: float = 3.0
-#     min_edge_pct: float = 3.8
-
-#     # lag_threshold_pct: lowered to 1.5 (your 1.0 fires on noise).
-#     # 1.5% lag is still a real signal; 1.0% fires on spread alone.
-#     # lag_threshold_pct: float = 1.5
-#     lag_threshold_pct: float = 1.8
-
-#     # max_position_pct: float = 5.0        # Reduced from 8% — safer for paper testing
-#     max_position_pct: float = 4.0
-#     # kelly_fraction: float = 0.35         # More conservative than 0.5
-#     kelly_fraction: float = 0.30
-#     # kill_switch_drawdown: float = 15.0   # Tighter drawdown limit during testing
-#     kill_switch_drawdown: float = 12.0
-
-#     # confidence_threshold: 65 is the right call for now.
-#     # 90 was blocking almost everything — need data to calibrate.
-#     # After 50+ paper trades, analyse win rate by confidence bucket and raise.
-#     # confidence_threshold: float = 65.0
-#     confidence_threshold: float = 60.0     # Slight increase
-
-#     max_slippage_pct: float = 1.5        # Max VWAP slippage vs best price (%)
-
-#     # ── Fee simulation (paper trading accuracy) ────────────────────────────
-#     # Polymarket average taker fee on short markets is ~1.65% (lower than peak 1.8%)
-#     taker_fee_pct: float = 1.65
-#     fee_buffer_pct: float = 0.60         # Buffer above fee — net min = 2.25%
-#     # Simulated execution slippage for paper P&L calculation
-#     simulated_slippage_pct: float = 0.45
-
-#     # ── Post-spike cooldown ────────────────────────────────────────────────
-#     spike_threshold_pct: float = 0.3
-#     spike_cooldown_sec: float = 15.0
-
-#     # ── Polymarket WebSocket ───────────────────────────────────────────────
-#     poly_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-
-#     # ── Binance WebSocket ──────────────────────────────────────────────────
-#     binance_ws_url: str = "wss://stream.binance.us:9443/stream"
-#     binance_ws_fallback: str = "wss://data-stream.binance.com/stream"
-
-#     # ── SQLite ─────────────────────────────────────────────────────────────
-#     db_path: str = "trades.db"
-
-#     # ── Rate limiting ──────────────────────────────────────────────────────
-#     order_cooldown_sec: float = 0.8      # Slightly tighter than 1.0
-#     ws_reconnect_delay: float = 5.0
-#     max_retries: int = 5
+CONFIG = Config()
 
 
 class SpikeCooldown:
@@ -180,8 +118,6 @@ class SpikeCooldown:
         if abs(price_change_pct) >= CONFIG.spike_threshold_pct:
             self.cooldown_until = now + CONFIG.spike_cooldown_sec
             log.info(f"⚠️ Big CEX spike detected ({price_change_pct:+.2f}%) — cooldown for {CONFIG.spike_cooldown_sec}s")
-
-CONFIG = Config()
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Logging
@@ -1325,14 +1261,13 @@ class SignalEngine:
             snap.asset, snap.direction, snap.duration
         )
 
-        edge = (fair_value - snap.yes_price) * 100 if snap.direction == "UP" else ((1 - fair_value) - snap.no_price) * 100
-    
-        log.debug(f"Eval {snap.asset} {snap.direction} | "
-              f"Fair={fair_value:.4f} | Poly={snap.yes_price:.4f} | "
-              f"Edge={edge:+.2f}% | Conf={confidence:.1f}%")
-        
-        if confidence >= CONFIG.confidence_threshold:   # temporary debug line
-            log.info(f"STRONG EDGE → {snap.asset} {snap.direction} | Edge={edge:+.2f}% | Conf={confidence:.1f}%")
+        edge_debug = (fair_value - snap.yes_price) * 100 if snap.direction == "UP" else ((1 - fair_value) - snap.no_price) * 100
+        log.debug("Eval %s %s | Fair=%.4f | Poly=%.4f | Edge=%+.2f%% | Conf=%.1f%%",
+                  snap.asset, snap.direction, fair_value, snap.yes_price,
+                  edge_debug, confidence)
+        if confidence >= CONFIG.confidence_threshold:
+            log.info("STRONG SIGNAL → %s %s | Edge=%+.2f%% | Conf=%.1f%%",
+                     snap.asset, snap.direction, edge_debug, confidence)
 
 
         if confidence < CONFIG.confidence_threshold:
@@ -1360,145 +1295,7 @@ class SignalEngine:
             confidence=confidence,
             kelly_size=0.0,
         )
-# class SignalEngine:
-#     """
-#     Computes fair value from CEX prices using:
-#       1. Multi-timeframe momentum (1min + 5min + 15min must agree)
-#       2. Order flow imbalance (Binance top-10 bid/ask volume ratio)
-#     Confidence score scales position size via KellySizer.
-#     """
 
-#     def __init__(self, price_feed: BinancePriceFeed):
-#         self.feed = price_feed
-#         self._price_history: dict[str, list[float]] = {"BTC": [], "ETH": []}
-
-#     def record_price(self, asset: str, price: float):
-#         hist = self._price_history[asset]
-#         hist.append(price)
-#         if len(hist) > 1000:  # ~16 min at 1 tick/sec
-#             hist.pop(0)
-
-#     def _momentum(self, hist: list[float], window: int) -> float:
-#         """Returns momentum % over the last `window` ticks."""
-#         if len(hist) < window:
-#             return 0.0
-#         start = hist[-window]
-#         current = hist[-1]
-#         return (current - start) / start * 100 if start > 0 else 0.0
-
-#     def _compute_fair_value(self, asset: str, direction: str, duration: str) -> tuple[float, float]:
-#         """
-#         Returns (fair_value_prob, confidence_score 0-100).
-
-#         Three signals are combined:
-#           - Short-term momentum (1min window)
-#           - Medium-term momentum matching duration
-#           - Order flow imbalance from Binance depth stream
-
-#         All three must agree directionally for max confidence.
-#         """
-#         import math
-#         hist = self._price_history[asset]
-#         current = self.feed.prices.get(asset, 0)
-#         ofi = self.feed.ofi.get(asset, 0.5)
-
-#         if current == 0 or len(hist) < 10:
-#             return 0.5, 0.0
-
-#         # ── Multi-timeframe momentum ────────────────────────────────────────
-#         mom_1min  = self._momentum(hist, min(60,  len(hist)))
-#         mom_5min  = self._momentum(hist, min(300, len(hist)))
-#         mom_15min = self._momentum(hist, min(900, len(hist)))
-
-#         duration_mom = mom_5min if duration == "5min" else mom_15min
-
-#         # All three timeframes must agree in direction
-#         signs = [
-#             1 if m > 0 else (-1 if m < 0 else 0)
-#             for m in [mom_1min, mom_5min, mom_15min]
-#         ]
-#         timeframe_agreement = len(set(s for s in signs if s != 0)) == 1
-
-#         # ── OFI signal ─────────────────────────────────────────────────────
-#         # OFI > 0.55 = buy pressure, < 0.45 = sell pressure
-#         ofi_bullish  = ofi > 0.55
-#         ofi_bearish  = ofi < 0.45
-#         ofi_neutral  = not ofi_bullish and not ofi_bearish
-
-#         # ── Combined fair value probability ────────────────────────────────
-#         # Sigmoid on duration momentum
-#         scale = 2.0
-#         raw_prob = 1 / (1 + math.exp(-duration_mom * scale / 100 * 10))
-
-#         # OFI nudge: push probability 3% toward the OFI-implied direction
-#         if ofi_bullish:
-#             raw_prob = min(raw_prob + 0.03, 0.99)
-#         elif ofi_bearish:
-#             raw_prob = max(raw_prob - 0.03, 0.01)
-
-#         fair_value = (1.0 - raw_prob) if direction == "DOWN" else raw_prob
-
-#         # ── Confidence score (0-100) ────────────────────────────────────────
-#         # Base: data sufficiency
-#         tick_conf = min(len(hist) / 300, 1.0) * 30          # up to 30 pts
-
-#         # Momentum strength
-#         mom_conf = min(abs(duration_mom) / 2.0, 1.0) * 30   # up to 30 pts
-
-#         # Timeframe agreement bonus
-#         agreement_conf = 25.0 if timeframe_agreement else 0.0
-
-#         # OFI agreement bonus: OFI direction matches momentum direction
-#         mom_is_up = duration_mom > 0
-#         ofi_agrees = (mom_is_up and ofi_bullish) or (not mom_is_up and ofi_bearish)
-#         ofi_conf = 15.0 if ofi_agrees else (0.0 if ofi_neutral else -10.0)
-
-#         confidence = min(tick_conf + mom_conf + agreement_conf + ofi_conf, 100.0)
-
-#         return fair_value, confidence
-
-#     def evaluate(self, snap: MarketSnapshot) -> Optional[TradeSignal]:
-#         fair_value, confidence = self._compute_fair_value(
-#             snap.asset, snap.direction, snap.duration
-#         )
-#         edge = (fair_value - snap.yes_price) * 100 if snap.direction == "UP" else ((1 - fair_value) - snap.no_price) * 100
-    
-#         log.debug(f"Eval {snap.asset} {snap.direction} | "
-#               f"Fair={fair_value:.4f} | Poly={snap.yes_price:.4f} | "
-#               f"Edge={edge:+.2f}% | Conf={confidence:.1f}%")
-        
-#         if confidence >= CONFIG.confidence_threshold:   # temporary debug line
-#             log.info(f"STRONG EDGE → {snap.asset} {snap.direction} | Edge={edge:+.2f}% | Conf={confidence:.1f}%")
-
-#         if confidence < CONFIG.confidence_threshold:
-#             return None
-
-#         yes_edge = (fair_value - snap.yes_price) * 100
-#         no_edge  = ((1 - fair_value) - snap.no_price) * 100
-
-#         if yes_edge >= CONFIG.min_edge_pct and abs(yes_edge) > abs(no_edge):
-#             side, poly_price, edge = "YES", snap.yes_price, yes_edge
-#         elif no_edge >= CONFIG.min_edge_pct:
-#             side, poly_price, edge = "NO", snap.no_price, no_edge
-#         else:
-#             return None
-
-#         lag = abs((fair_value - snap.yes_price) * 100)
-#         if lag < CONFIG.lag_threshold_pct:
-#             return None
-
-#         return TradeSignal(
-#             market_id=snap.market_id,
-#             asset=snap.asset,
-#             direction=snap.direction,
-#             duration=snap.duration,
-#             side=side,
-#             poly_price=poly_price,
-#             fair_value=fair_value,
-#             edge_pct=edge,
-#             confidence=confidence,
-#             kelly_size=0.0,  # filled by KellySizer
-#         )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1895,17 +1692,27 @@ class ArbBot:
             log.debug("Skipping blacklisted market %s", snap.market_id)
             return
 
-        # Check daily drawdown kill switch
+        # Check daily drawdown kill switch + daily profit ceiling
         daily_pnl = self.db.daily_pnl()
         portfolio = self.sizer.portfolio_value
-        if portfolio > 0 and (-daily_pnl / portfolio * 100) >= CONFIG.kill_switch_drawdown:
-            if not self.kill_switch:
-                self.kill_switch = True
-                self.dashboard.kill_switch_active = True
-                msg = f"⛔ KILL SWITCH ACTIVATED – Daily drawdown exceeded {CONFIG.kill_switch_drawdown}%"
-                log.critical(msg)
-                await self.notifier.send(f"*{msg}*")
-            return
+        if portfolio > 0:
+            daily_pnl_pct = daily_pnl / portfolio * 100
+            if (-daily_pnl_pct) >= CONFIG.kill_switch_drawdown:
+                if not self.kill_switch:
+                    self.kill_switch = True
+                    self.dashboard.kill_switch_active = True
+                    msg = f"⛔ KILL SWITCH – Drawdown exceeded {CONFIG.kill_switch_drawdown}%"
+                    log.critical(msg)
+                    await self.notifier.send(f"*{msg}*")
+                return
+            if daily_pnl_pct >= CONFIG.max_daily_profit_pct:
+                if not self.kill_switch:
+                    self.kill_switch = True
+                    self.dashboard.kill_switch_active = True
+                    msg = f"🏁 DAILY PROFIT TARGET HIT +{daily_pnl_pct:.1f}% — trading paused"
+                    log.info(msg)
+                    await self.notifier.send(f"*{msg}*")
+                return
 
         sig = self.signal_engine.evaluate(snap)
         if sig is None:
@@ -1955,43 +1762,17 @@ class ArbBot:
 
                 # Simulate close for paper trades and update market stats
                 if pos.status == "PAPER":
-                    # # Realistic paper P&L:
-                    # # Win: receive $1 per token, paid entry_price + fee + slippage
-                    # # Loss: token expires worthless, lose entry_price + fee + slippage
-                    # fee_cost = pos.entry_price * (CONFIG.taker_fee_pct / 100)
-                    # slip_cost = pos.entry_price * (CONFIG.simulated_slippage_pct / 100)
-                    # total_cost_per_token = pos.entry_price + fee_cost + slip_cost
-
-                    # # fair_value is our estimate of true probability of winning
-                    # # Expected P&L = prob_win * (1 - total_cost) - prob_loss * total_cost
-                    # prob_win = sig.fair_value if sig.side == "YES" else (1 - sig.fair_value)
-                    # gross_pnl = (prob_win * (1.0 - total_cost_per_token)
-                    #              - (1 - prob_win) * total_cost_per_token) * size
-                    # pnl = round(gross_pnl, 4)
-
-                    # self.db.update_trade(pos.trade_id, "CLOSED", pnl, time.time())
-                    # self.db.update_market_stats(
-                    #     pos.market_id, pos.asset, pos.direction, snap.duration, pnl
-                    # )
-                    # self.sizer.record_result(pnl > 0)
-                    # pos.pnl = pnl
-                    # pos.status = "CLOSED"
-                    
-                    # Calculate real cost per token
-                    fee_cost = pos.entry_price * (CONFIG.taker_fee_pct / 100.0)
+                    # Calculate real cost per token including fees and slippage
+                    fee_cost  = pos.entry_price * (CONFIG.taker_fee_pct / 100.0)
                     slip_cost = pos.entry_price * (CONFIG.simulated_slippage_pct / 100.0)
                     total_cost_per_token = pos.entry_price + fee_cost + slip_cost
 
-                    # Probability of winning based on our fair value
+                    # Simulate binary outcome using our fair value as probability
                     prob_win = sig.fair_value if sig.side == "YES" else (1 - sig.fair_value)
-
-                    # Simulate actual outcome
-                    import random
                     if random.random() < prob_win:
-                        pnl = (1.0 - total_cost_per_token) * pos.size_usdc      # Win
+                        pnl = (1.0 - total_cost_per_token) * pos.size_usdc   # Win
                     else:
-                        pnl = -total_cost_per_token * pos.size_usdc             # Loss
-
+                        pnl = -total_cost_per_token * pos.size_usdc           # Loss
                     pnl = round(pnl, 4)
 
                     # Update database and stats
