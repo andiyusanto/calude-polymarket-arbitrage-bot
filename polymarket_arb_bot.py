@@ -21,6 +21,7 @@ import logging
 import sqlite3
 import time
 import argparse
+import random
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date
 from typing import Optional
@@ -809,7 +810,6 @@ class PolymarketMonitor:
             try:
                 client = self._get_client()
                 loop = asyncio.get_running_loop()
-                await asyncio.sleep(attempt * 0.1)  # reduced jitter
                 book = await loop.run_in_executor(
                     self._executor, lambda mid=market_id: client.get_order_book(mid)
                 )
@@ -831,30 +831,49 @@ class PolymarketMonitor:
                     bids=bids,
                 )
             except Exception as e:
-                # 400 = token expired/invalid — don't retry
                 err_str = str(e)
+
+                # Hard error: token expired/invalid — drop immediately, no retry
                 if "400" in err_str or "status_code=400" in err_str:
-                    log.debug("Token %s returned 400 (likely expired), dropping", market_id[:14])
-                    # Mark as expired so we skip it next cycle
+                    log.debug("Token %s returned 400 (expired), dropping", market_id[:14])
                     meta["end_ts"] = 0
                     return None
-                backoff = 2 ** attempt
-                log.warning("Polymarket fetch failed for %s (attempt %d): %s – retry in %ds",
-                            market_id[:14], attempt + 1, e, backoff)
+
+                # Fix 3: gentle backoff for transient "Request exception" (network hiccup)
+                # These don't need exponential backoff — a short wait is enough
+                is_transient = "Request exception" in err_str or "request exception" in err_str.lower()
+                if is_transient:
+                    # 0.5s, 1.0s, 1.5s, 2.0s — linear and short
+                    backoff = 0.5 * (attempt + 1) + random.uniform(0, 0.3)
+                    log.debug("Transient error %s (attempt %d) – retry in %.1fs",
+                              market_id[:14], attempt + 1, backoff)
+                else:
+                    # True exponential for real errors (auth, server error, etc.)
+                    backoff = 2 ** attempt + random.uniform(0, 0.5)
+                    log.warning("Polymarket fetch failed for %s (attempt %d): %s – retry in %.1fs",
+                                market_id[:14], attempt + 1, e, backoff)
+
                 await asyncio.sleep(backoff)
         return None
 
-    async def run(self, poll_interval: float = 0.5):
+    async def run(self, poll_interval: float = 1.5):
         self._running = True
         await self._discover_markets()
         last_discovery = time.time()
         REDISCOVER_INTERVAL = 180  # re-discover every 3 minutes (5M markets rotate)
+
+        # Fix 4: cooldown after discovery — let the WS feed warm up before
+        # hammering REST, avoids the burst of Request exceptions on startup
+        log.info("Waiting 12s after discovery before starting REST polling…")
+        await asyncio.sleep(12)
 
         while self._running:
             # Re-discover periodically since 5M markets expire and new ones open
             if time.time() - last_discovery > REDISCOVER_INTERVAL:
                 await self._discover_markets()
                 last_discovery = time.time()
+                # Cooldown after re-discovery too
+                await asyncio.sleep(12)
 
             if not self.market_ids:
                 log.warning("No market IDs — retrying discovery in 30s")
@@ -863,14 +882,14 @@ class PolymarketMonitor:
                 last_discovery = time.time()
                 continue
 
-            # Fetch in small concurrent batches of 3 to balance speed vs rate limiting
+            # Fix 1: reduced batch size to 2 since WS is primary feed
             active_ids = {
                 mid: meta for mid, meta in self.market_ids.items()
                 if not meta.get("end_ts") or meta["end_ts"] > time.time() + 30
             }
 
             items = list(active_ids.items())
-            BATCH_SIZE = 3
+            BATCH_SIZE = 2
             for i in range(0, len(items), BATCH_SIZE):
                 batch = items[i:i + BATCH_SIZE]
                 results = await asyncio.gather(
@@ -882,9 +901,10 @@ class PolymarketMonitor:
                         self.snapshots[snap.market_id] = snap
                         for cb in self._callbacks:
                             asyncio.create_task(cb(snap))
-                await asyncio.sleep(0.05)  # 50ms between batches
+                await asyncio.sleep(0.1)  # gap between batches
 
-            await asyncio.sleep(poll_interval)
+            # Fix 2: random jitter prevents synchronised rate-limit hits
+            await asyncio.sleep(poll_interval + random.uniform(0.1, 0.3))
 
     def stop(self):
         self._running = False
