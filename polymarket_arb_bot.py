@@ -74,20 +74,26 @@ class Config:
     # min_edge_pct: lowered to 3.0 (your 2.0 is too thin vs 1.65% avg fee).
     # With taker_fee_pct=1.65 + fee_buffer=0.6, effective floor = 2.25% net.
     # 3.0 gives ~1.35% net edge after fees — worth trading.
-    min_edge_pct: float = 3.0
+    # min_edge_pct: float = 3.0
+    min_edge_pct: float = 3.8
 
     # lag_threshold_pct: lowered to 1.5 (your 1.0 fires on noise).
     # 1.5% lag is still a real signal; 1.0% fires on spread alone.
-    lag_threshold_pct: float = 1.5
+    # lag_threshold_pct: float = 1.5
+    lag_threshold_pct: float = 1.8
 
-    max_position_pct: float = 5.0        # Reduced from 8% — safer for paper testing
-    kelly_fraction: float = 0.35         # More conservative than 0.5
-    kill_switch_drawdown: float = 15.0   # Tighter drawdown limit during testing
+    # max_position_pct: float = 5.0        # Reduced from 8% — safer for paper testing
+    max_position_pct: float = 4.0
+    # kelly_fraction: float = 0.35         # More conservative than 0.5
+    kelly_fraction: float = 0.30
+    # kill_switch_drawdown: float = 15.0   # Tighter drawdown limit during testing
+    kill_switch_drawdown: float = 12.0
 
     # confidence_threshold: 65 is the right call for now.
     # 90 was blocking almost everything — need data to calibrate.
     # After 50+ paper trades, analyse win rate by confidence bucket and raise.
-    confidence_threshold: float = 65.0
+    # confidence_threshold: float = 65.0
+    confidence_threshold: float = 60.0     # Slight increase
 
     max_slippage_pct: float = 1.5        # Max VWAP slippage vs best price (%)
 
