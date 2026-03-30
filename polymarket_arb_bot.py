@@ -926,15 +926,17 @@ class PolymarketWSFeed:
     """
     Hybrid WS primary + REST fallback for Polymarket order books.
 
-    Architecture:
-      - WS receives pushed book updates in real-time (primary)
-      - _last_msg_time tracks liveness — if stale >25s, REST takes over
-      - Tries both known subscription message formats on connect
-      - Logs raw WS messages at DEBUG on first connect so you can see
-        the actual payload structure and tune the parser
+    Key design decisions based on observed WS behaviour:
+      - Subscribe in batches of 15 with 0.8s spacing (bulk subscribe gets dropped/rejected)
+      - WS sends bids/asks as [[price, size], ...] arrays, NOT {"price":…} dicts
+      - Control messages ("INVALID OPERATION", "subscription", "welcome") must be
+        filtered before json.loads to avoid spurious parse errors
+      - _last_msg_time drives REST fallback — if WS silent >25s, REST takes over
     """
 
-    WS_STALE_SEC = 25.0   # seconds of silence before declaring WS dead
+    WS_STALE_SEC   = 25.0
+    SUB_BATCH_SIZE = 15    # tokens per subscription batch
+    SUB_BATCH_DELAY = 0.8  # seconds between subscription batches
 
     def __init__(self):
         self._books: dict[str, dict] = {}
@@ -942,9 +944,9 @@ class PolymarketWSFeed:
         self._market_meta: dict[str, dict] = {}
         self._running = False
         self._ws = None
-        self._last_msg_time: float = 0.0   # ← staleness tracker
+        self._last_msg_time: float = 0.0
         self._connected: bool = False
-        self._debug_logged: bool = False    # log raw payload once on first connect
+        self._debug_logged: bool = False
 
     def on_snapshot(self, cb):
         self._callbacks.append(cb)
@@ -954,7 +956,6 @@ class PolymarketWSFeed:
 
     @property
     def is_healthy(self) -> bool:
-        """True if WS is connected and received a message in the last 25s."""
         if not self._connected:
             return False
         return (time.time() - self._last_msg_time) < self.WS_STALE_SEC
@@ -975,89 +976,125 @@ class PolymarketWSFeed:
             bids=book.get("bids", []),
         )
 
-    def _parse_book(self, data: dict) -> Optional[tuple[str, dict]]:
+    def _parse_level(self, level) -> Optional[tuple[float, float]]:
+        """
+        Parse a single order book level.
+        Polymarket sends levels as [price, size] arrays.
+        Some endpoints use {"price": x, "size": y} dicts — handle both.
+        """
         try:
-            # Polymarket uses asset_id, asset, or market depending on event type
-            asset_id = (data.get("asset_id") or data.get("asset") or
-                        data.get("market") or data.get("token_id"))
-            if not asset_id or str(asset_id) not in self._market_meta:
-                return None
+            if isinstance(level, (list, tuple)) and len(level) >= 2:
+                return float(level[0]), float(level[1])
+            elif isinstance(level, dict):
+                p = level.get("price") or level.get("p") or level.get("px")
+                s = level.get("size") or level.get("s") or level.get("sz")
+                if p is not None and s is not None:
+                    return float(p), float(s)
+        except (ValueError, TypeError):
+            pass
+        return None
 
-            asks_raw = data.get("asks") or data.get("ask") or []
+    def _parse_levels(self, raw) -> list[tuple[float, float]]:
+        if not isinstance(raw, list):
+            return []
+        parsed = [self._parse_level(l) for l in raw]
+        return [x for x in parsed if x is not None]
+
+    async def _process_ws_update(self, data: dict):
+        """Parse a single order book update message into a MarketSnapshot."""
+        try:
+            market_id = (data.get("market") or data.get("asset_id") or
+                         data.get("asset") or data.get("token_id"))
+            if not market_id or str(market_id) not in self._market_meta:
+                return
+
+            market_id = str(market_id)
             bids_raw = data.get("bids") or data.get("bid") or []
+            asks_raw = data.get("asks") or data.get("ask") or []
 
-            asks = sorted(
-                [(float(l.get("price", 0)), float(l.get("size", 0)))
-                 for l in (asks_raw if isinstance(asks_raw, list) else [])
-                 if l.get("price")],
-                key=lambda x: x[0]
-            )
-            bids = sorted(
-                [(float(l.get("price", 0)), float(l.get("size", 0)))
-                 for l in (bids_raw if isinstance(bids_raw, list) else [])
-                 if l.get("price")],
-                key=lambda x: -x[0]
-            )
+            bids = sorted(self._parse_levels(bids_raw), key=lambda x: -x[0])
+            asks = sorted(self._parse_levels(asks_raw), key=lambda x:  x[0])
 
-            best_ask = asks[0][0] if asks else 0.5
+            if not bids and not asks:
+                return  # empty book — skip
+
             best_bid = bids[0][0] if bids else 0.5
-            yes_price = (best_ask + best_bid) / 2
+            best_ask = asks[0][0] if asks else 0.5
+            yes_price = (best_bid + best_ask) / 2
 
-            return str(asset_id), {"asks": asks, "bids": bids, "yes_price": yes_price}
+            book = {
+                "bids":      bids[:10],
+                "asks":      asks[:10],
+                "yes_price": yes_price,
+            }
+            self._books[market_id] = book
+
+            snap = self.get_snapshot(market_id)
+            if snap:
+                for cb in self._callbacks:
+                    asyncio.create_task(cb(snap))
+
         except Exception as e:
-            log.debug("WS book parse error: %s", e)
-            return None
+            log.debug("WS update processing error: %s", e)
 
     async def _subscribe(self, ws):
-        """Try both known subscription message formats."""
+        """Subscribe to active tokens in batches to avoid server-side overload."""
         token_ids = list(self._market_meta.keys())
+        total = len(token_ids)
+        batches = range(0, total, self.SUB_BATCH_SIZE)
+        for i in batches:
+            batch = token_ids[i:i + self.SUB_BATCH_SIZE]
+            await ws.send(json.dumps({"type": "subscribe", "assets": batch}))
+            log.info("WS subscribed batch %d/%d (%d tokens)",
+                     i // self.SUB_BATCH_SIZE + 1, -(-total // self.SUB_BATCH_SIZE),
+                     len(batch))
+            if i + self.SUB_BATCH_SIZE < total:
+                await asyncio.sleep(self.SUB_BATCH_DELAY)
 
-        # Format 1: documented in some Polymarket repos
-        await ws.send(json.dumps({"assets_ids": token_ids, "type": "Market"}))
-        # Format 2: recommendation uses this format
-        await ws.send(json.dumps({"type": "subscribe", "assets": token_ids}))
-
-        log.info("Polymarket WS subscribed (%d tokens) — waiting for messages…",
-                 len(token_ids))
-
-    async def _process_message(self, raw: str):
-        """Parse and dispatch a raw WS message."""
+    async def _handle_message(self, raw: str):
+        """Parse and dispatch one raw WS message."""
         self._last_msg_time = time.time()
 
-        # Log raw payload once so we can see actual structure in logs
-        if not self._debug_logged:
-            log.debug("WS first message (raw): %s", raw[:500])
+        # Log first real message for parser calibration
+        if not self._debug_logged and raw.strip().startswith("{"):
+            log.debug("WS first message (raw): %s", raw[:400])
             self._debug_logged = True
 
-        try:
-            msgs = json.loads(raw)
-        except json.JSONDecodeError:
-            if raw.strip():
-                log.debug("WS non-JSON: %s", raw[:100])
+        # Fast-path: filter known non-JSON control strings before parsing
+        if not raw or not raw.strip():
+            return
+        if "INVALID OPERATION" in raw:
+            log.debug("WS control message: INVALID OPERATION")
             return
 
-        if not isinstance(msgs, list):
-            msgs = [msgs]
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            log.debug("WS non-JSON: %s", raw[:120])
+            return
 
-        for msg in msgs:
+        # Normalise to list
+        if not isinstance(data, list):
+            data = [data]
+
+        for msg in data:
             if not isinstance(msg, dict):
                 continue
-            event_type = (msg.get("event_type") or msg.get("type") or
-                          msg.get("eventType") or "")
-            # Accept all known event types that carry book data
-            if event_type in ("book", "price_change", "last_trade_price",
-                              "update", "orderbook", "tick"):
-                result = self._parse_book(msg)
-                if result:
-                    token_id, book = result
-                    self._books[token_id] = book
-                    snap = self.get_snapshot(token_id)
-                    if snap:
-                        for cb in self._callbacks:
-                            asyncio.create_task(cb(snap))
-            elif event_type not in ("", "connected", "pong", "heartbeat"):
-                log.debug("WS unhandled event_type=%s keys=%s",
-                          event_type, list(msg.keys())[:6])
+
+            # Skip control / handshake message types
+            msg_type = (msg.get("type") or msg.get("event") or
+                        msg.get("event_type") or "").lower()
+            if msg_type in ("subscription", "subscribed", "welcome",
+                            "pong", "heartbeat", "connected", ""):
+                continue
+
+            # Book data arrives under several event type names
+            if msg_type in ("book", "price_change", "last_trade_price",
+                            "update", "orderbook", "tick"):
+                await self._process_ws_update(msg)
+            else:
+                log.debug("WS unhandled type=%s keys=%s", msg_type,
+                          list(msg.keys())[:6])
 
     async def run(self):
         self._running = True
@@ -1069,18 +1106,19 @@ class PolymarketWSFeed:
                 async with websockets.connect(
                     CONFIG.poly_ws_url,
                     ping_interval=20,
-                    ping_timeout=10,
+                    ping_timeout=30,
                     max_size=2**20,
                     additional_headers={"User-Agent": "polymarket-arb-bot/1.0"},
                 ) as ws:
                     self._ws = ws
                     self._connected = True
                     self._last_msg_time = time.time()
-                    self._debug_logged = False   # reset so we log the first msg
+                    self._debug_logged = False
+
                     await self._subscribe(ws)
 
                     async for raw in ws:
-                        await self._process_message(raw)
+                        await self._handle_message(raw)
 
             except (websockets.exceptions.ConnectionClosed,
                     websockets.exceptions.WebSocketException,
