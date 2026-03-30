@@ -70,39 +70,50 @@ class Config:
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # Trading parameters
-    min_edge_pct: float = 2.0           # 3.5           # Lowered — fee filter now handles the real floor
-    lag_threshold_pct: float =  1.0     # 3.0      # Polymarket lag vs CEX to flag (%)
-    max_position_pct: float = 8.0       # Max position as % of portfolio
-    confidence_threshold: float = 65.0  # 90.0  # Raised — fewer but higher-quality signals
-    kelly_fraction: float = 0.5         # Half-Kelly
-    kill_switch_drawdown: float = 20.0  # Daily drawdown % to halt all trading
-    max_slippage_pct: float = 1.5       # Max acceptable VWAP slippage vs best price (%)
+    # ── Trading parameters ─────────────────────────────────────────────────
+    # min_edge_pct: lowered to 3.0 (your 2.0 is too thin vs 1.65% avg fee).
+    # With taker_fee_pct=1.65 + fee_buffer=0.6, effective floor = 2.25% net.
+    # 3.0 gives ~1.35% net edge after fees — worth trading.
+    min_edge_pct: float = 3.0
 
-    # Fee-aware trading
-    # Polymarket taker fee is ~1.8% peak. Only trade if edge > fee + buffer.
-    # Set to 0 to disable (e.g. if you have a maker rebate).
-    taker_fee_pct: float = 1.8          # Current Polymarket peak taker fee (%)
-    fee_buffer_pct: float = 0.8         # Extra buffer above fee before trading
-    # Effective min edge = taker_fee_pct + fee_buffer_pct = 2.6% minimum net edge
+    # lag_threshold_pct: lowered to 1.5 (your 1.0 fires on noise).
+    # 1.5% lag is still a real signal; 1.0% fires on spread alone.
+    lag_threshold_pct: float = 1.5
 
-    # Post-spike cooldown: avoid trading N seconds after a violent CEX move
-    # Violent = BTC/ETH moves more than spike_threshold_pct in a single tick
-    spike_threshold_pct: float = 0.3    # % single-tick move that triggers cooldown
-    spike_cooldown_sec: float = 15.0    # Seconds to pause after a spike
+    max_position_pct: float = 5.0        # Reduced from 8% — safer for paper testing
+    kelly_fraction: float = 0.35         # More conservative than 0.5
+    kill_switch_drawdown: float = 15.0   # Tighter drawdown limit during testing
 
-    # Polymarket WebSocket
+    # confidence_threshold: 65 is the right call for now.
+    # 90 was blocking almost everything — need data to calibrate.
+    # After 50+ paper trades, analyse win rate by confidence bucket and raise.
+    confidence_threshold: float = 65.0
+
+    max_slippage_pct: float = 1.5        # Max VWAP slippage vs best price (%)
+
+    # ── Fee simulation (paper trading accuracy) ────────────────────────────
+    # Polymarket average taker fee on short markets is ~1.65% (lower than peak 1.8%)
+    taker_fee_pct: float = 1.65
+    fee_buffer_pct: float = 0.60         # Buffer above fee — net min = 2.25%
+    # Simulated execution slippage for paper P&L calculation
+    simulated_slippage_pct: float = 0.45
+
+    # ── Post-spike cooldown ────────────────────────────────────────────────
+    spike_threshold_pct: float = 0.3
+    spike_cooldown_sec: float = 15.0
+
+    # ── Polymarket WebSocket ───────────────────────────────────────────────
     poly_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-    # Binance WebSocket — use stream.binance.us if your server gets HTTP 451
+    # ── Binance WebSocket ──────────────────────────────────────────────────
     binance_ws_url: str = "wss://stream.binance.us:9443/stream"
     binance_ws_fallback: str = "wss://data-stream.binance.com/stream"
 
-    # SQLite
+    # ── SQLite ─────────────────────────────────────────────────────────────
     db_path: str = "trades.db"
 
-    # Rate limiting
-    order_cooldown_sec: float = 1.0
+    # ── Rate limiting ──────────────────────────────────────────────────────
+    order_cooldown_sec: float = 0.8      # Slightly tighter than 1.0
     ws_reconnect_delay: float = 5.0
     max_retries: int = 5
 
@@ -1303,7 +1314,7 @@ class SignalEngine:
         confidence = min(tick_conf + mom_conf + agreement_conf + ofi_conf, 100.0)
 
         return fair_value, confidence
-    
+
     def evaluate(self, snap: MarketSnapshot) -> Optional[TradeSignal]:
         fair_value, confidence = self._compute_fair_value(
             snap.asset, snap.direction, snap.duration
@@ -1793,7 +1804,20 @@ class ArbBot:
 
                 # Simulate close for paper trades and update market stats
                 if pos.status == "PAPER":
-                    pnl = (sig.fair_value - pos.entry_price) * size
+                    # Realistic paper P&L:
+                    # Win: receive $1 per token, paid entry_price + fee + slippage
+                    # Loss: token expires worthless, lose entry_price + fee + slippage
+                    fee_cost = pos.entry_price * (CONFIG.taker_fee_pct / 100)
+                    slip_cost = pos.entry_price * (CONFIG.simulated_slippage_pct / 100)
+                    total_cost_per_token = pos.entry_price + fee_cost + slip_cost
+
+                    # fair_value is our estimate of true probability of winning
+                    # Expected P&L = prob_win * (1 - total_cost) - prob_loss * total_cost
+                    prob_win = sig.fair_value if sig.side == "YES" else (1 - sig.fair_value)
+                    gross_pnl = (prob_win * (1.0 - total_cost_per_token)
+                                 - (1 - prob_win) * total_cost_per_token) * size
+                    pnl = round(gross_pnl, 4)
+
                     self.db.update_trade(pos.trade_id, "CLOSED", pnl, time.time())
                     self.db.update_market_stats(
                         pos.market_id, pos.asset, pos.direction, snap.duration, pnl
@@ -1801,6 +1825,9 @@ class ArbBot:
                     self.sizer.record_result(pnl > 0)
                     pos.pnl = pnl
                     pos.status = "CLOSED"
+                    log.info("[PAPER P&L] %s %s edge=%.1f%% fee=%.2f%% slip=%.2f%% → $%.4f",
+                             sig.asset, sig.direction, sig.edge_pct,
+                             CONFIG.taker_fee_pct, CONFIG.simulated_slippage_pct, pnl)
 
                 ofi = self.price_feed.ofi.get(sig.asset, 0.5)
                 msg = (
