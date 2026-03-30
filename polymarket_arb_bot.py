@@ -1705,13 +1705,17 @@ class ArbBot:
             log.debug("Skipping blacklisted market %s", snap.market_id)
             return
 
-        # === DAILY PROFIT TARGET CHECK ===
+        # === DAILY PROFIT TARGET CHECK (Fixed) ===
         daily_pnl = self.db.daily_pnl()
-        if CONFIG.max_daily_profit_pct > 0 and self.sizer.portfolio_value > 0:
-            profit_pct = (daily_pnl / self.sizer.portfolio_value) * 100
+        portfolio_value = self.sizer.portfolio_value
+
+        if CONFIG.max_daily_profit_pct > 0 and portfolio_value > 0:
+            profit_pct = (daily_pnl / portfolio_value) * 100
             
             if profit_pct >= CONFIG.max_daily_profit_pct:
-                if not self.daily_pauser.is_paused():
+                if not hasattr(self, 'daily_pauser') or not self.daily_pauser.is_paused():
+                    if not hasattr(self, 'daily_pauser'):
+                        self.daily_pauser = DailyProfitPauser()
                     self.daily_pauser.trigger_pause(profit_pct)
                     msg = f"🎯 DAILY PROFIT TARGET HIT (+{profit_pct:.1f}%) — Pausing for {CONFIG.daily_profit_pause_hours} hours"
                     log.info(msg)
