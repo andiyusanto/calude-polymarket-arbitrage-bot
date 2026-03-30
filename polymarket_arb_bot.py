@@ -70,16 +70,16 @@ class Config:
     poly_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     binance_ws_url: str = "wss://stream.binance.us:9443/stream"
     binance_ws_fallback: str = "wss://data-stream.binance.com/stream"
-    
+
     # Telegram
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # === HIGHER FREQUENCY TUNING ===
-    min_edge_pct: float = 3.2
-    lag_threshold_pct: float = 1.5
-    max_position_pct: float = 4.5
-    confidence_threshold: float = 52.0      # Lowered for more signals
+    min_edge_pct: float = 2.8           # Lowered for more trades
+    lag_threshold_pct: float = 1.4
+    max_position_pct: float = 4.8
+    confidence_threshold: float = 50.0  # Lowered → more signals
     kelly_fraction: float = 0.33
 
     # Risk controls
@@ -94,11 +94,11 @@ class Config:
 
     # Spike cooldown
     spike_threshold_pct: float = 0.35
-    spike_cooldown_sec: float = 18.0
+    spike_cooldown_sec: float = 15.0     # Shorter cooldown
 
     # Other
     db_path: str = "trades.db"
-    order_cooldown_sec: float = 0.8
+    order_cooldown_sec: float = 0.6      # Faster order cooldown
     ws_reconnect_delay: float = 5.0
     max_retries: int = 5
     max_slippage_pct: float = 1.5      # Max acceptable VWAP slippage vs best price (%)
@@ -1237,29 +1237,29 @@ class SignalEngine:
     def record_price(self, asset: str, price: float):
         hist = self._price_history[asset]
         hist.append(price)
-        if len(hist) > 1500:
+        if len(hist) > 1200:
             hist.pop(0)
 
     def _compute_fair_value(self, asset: str, direction: str, duration: str) -> tuple[float, float]:
         hist = self._price_history[asset]
-        if len(hist) < 30:
+        if len(hist) < 25:
             return 0.5, 0.0
 
         current = self.feed.prices.get(asset, 0)
         ofi = self.feed.ofi.get(asset, 0.5)
 
-        mom_short = (current - hist[-18]) / hist[-18] * 100 if hist[-18] > 0 else 0
-        mom_med   = (current - hist[-65]) / hist[-65] * 100 if len(hist) > 65 else mom_short
+        mom_short = (current - hist[-15]) / hist[-15] * 100 if hist[-15] > 0 else 0
+        mom_med   = (current - hist[-60]) / hist[-60] * 100 if len(hist) > 60 else mom_short
 
-        raw_prob = 0.5 + (mom_short * 0.023) + (mom_med * 0.014)
-        if ofi > 0.56: raw_prob += 0.04
-        elif ofi < 0.44: raw_prob -= 0.04
+        raw_prob = 0.5 + (mom_short * 0.026) + (mom_med * 0.015)
+        if ofi > 0.55: raw_prob += 0.045
+        elif ofi < 0.45: raw_prob -= 0.045
 
         raw_prob = max(0.10, min(0.90, raw_prob))
         fair_value = raw_prob if direction == "UP" else (1 - raw_prob)
 
-        mom_strength = min(abs(mom_short) / 1.3, 1.0) * 55
-        ofi_bonus = 18 if abs(ofi - 0.5) > 0.10 else 9
+        mom_strength = min(abs(mom_short) / 1.2, 1.0) * 52
+        ofi_bonus = 18 if abs(ofi - 0.5) > 0.09 else 8
         confidence = min(mom_strength + ofi_bonus, 100.0)
 
         return fair_value, confidence
@@ -1271,7 +1271,7 @@ class SignalEngine:
 
         edge = (fair_value - snap.yes_price) * 100 if snap.direction == "UP" else ((1 - fair_value) - snap.no_price) * 100
 
-        if confidence >= 48 or abs(edge) >= 4.0:
+        if confidence >= 45 or abs(edge) >= 3.5:
             log.debug(f"Eval {snap.asset} {snap.direction} | Edge={edge:+.2f}% | Conf={confidence:.1f}%")
 
         if confidence < CONFIG.confidence_threshold:
