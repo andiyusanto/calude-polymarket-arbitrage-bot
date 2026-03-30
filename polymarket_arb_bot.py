@@ -935,8 +935,8 @@ class PolymarketWSFeed:
     """
 
     WS_STALE_SEC   = 25.0
-    SUB_BATCH_SIZE = 15    # tokens per subscription batch
-    SUB_BATCH_DELAY = 0.8  # seconds between subscription batches
+    SUB_BATCH_SIZE = 12    # smaller batches = more stable per Polymarket server
+    SUB_BATCH_DELAY = 1.2  # seconds between subscription batches
 
     def __init__(self):
         self._books: dict[str, dict] = {}
@@ -1038,19 +1038,26 @@ class PolymarketWSFeed:
             log.debug("WS update processing error: %s", e)
 
     async def _subscribe(self, ws):
-        """Subscribe to active tokens in batches to avoid server-side overload."""
+        """Subscribe using the correct Polymarket WS protocol format."""
         token_ids = list(self._market_meta.keys())
         total = len(token_ids)
-        batches = range(0, total, self.SUB_BATCH_SIZE)
-        for i in batches:
-            batch = token_ids[i:i + self.SUB_BATCH_SIZE]
-            await ws.send(json.dumps({"type": "subscribe", "assets": batch}))
-            log.info("WS subscribed batch %d/%d (%d tokens)",
-                     i // self.SUB_BATCH_SIZE + 1, -(-total // self.SUB_BATCH_SIZE),
-                     len(batch))
-            if i + self.SUB_BATCH_SIZE < total:
-                await asyncio.sleep(self.SUB_BATCH_DELAY)
+        n_batches = -(-total // self.SUB_BATCH_SIZE)  # ceiling division
 
+        for i in range(0, total, self.SUB_BATCH_SIZE):
+            batch = token_ids[i:i + self.SUB_BATCH_SIZE]
+            # Correct Polymarket format: type="market", key="assets_ids" (with underscore)
+            msg = {
+                "type": "market",
+                "assets_ids": batch,
+                "custom_feature_enabled": True,
+            }
+            await ws.send(json.dumps(msg))
+            log.info("WS subscribed batch %d/%d (%d tokens)",
+                     i // self.SUB_BATCH_SIZE + 1, n_batches, len(batch))
+            if i + self.SUB_BATCH_SIZE < total:
+                await asyncio.sleep(1.2)  # give server time to process each batch
+
+        log.info("WS all %d tokens subscribed", total)
     async def _handle_message(self, raw: str):
         """Parse and dispatch one raw WS message."""
         self._last_msg_time = time.time()
@@ -1081,16 +1088,22 @@ class PolymarketWSFeed:
             if not isinstance(msg, dict):
                 continue
 
-            # Skip control / handshake message types
+            # Skip anything that looks like a control/error response
             msg_type = (msg.get("type") or msg.get("event") or
                         msg.get("event_type") or "").lower()
             if msg_type in ("subscription", "subscribed", "welcome",
                             "pong", "heartbeat", "connected", ""):
+                log.debug("WS control: type=%s", msg_type or "(empty)")
+                continue
+
+            # Catch INVALID OPERATION buried inside a parsed dict
+            if "INVALID" in str(msg).upper():
+                log.debug("WS server rejection: %s", str(msg)[:120])
                 continue
 
             # Book data arrives under several event type names
             if msg_type in ("book", "price_change", "last_trade_price",
-                            "update", "orderbook", "tick"):
+                            "update", "orderbook", "tick", "market"):
                 await self._process_ws_update(msg)
             else:
                 log.debug("WS unhandled type=%s keys=%s", msg_type,
