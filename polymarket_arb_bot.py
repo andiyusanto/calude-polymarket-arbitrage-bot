@@ -84,7 +84,7 @@ class Config:
     kelly_fraction: float = 0.34
 
     kill_switch_drawdown: float = 15.0
-    max_daily_profit_pct: float = 10000.0
+    max_daily_profit_pct: float = 100.0
     daily_profit_pause_hours: float = 6.0
 
     taker_fee_pct: float = 1.65
@@ -296,7 +296,7 @@ class Database:
             "size_usdc": pos.size_usdc,
             "fair_value": pos.fair_value_at_entry,
             "edge_pct": pos.edge_at_entry,
-            "confidence": 0,
+            "confidence": pos.fair_value_at_entry,  # repurpose for now; add confidence field later
             "status": pos.status,
             "pnl": pos.pnl,
             "mode": mode,
@@ -1721,7 +1721,7 @@ class ArbBot:
         self.db = Database(CONFIG.db_path)
         self.price_feed = BinancePriceFeed()
         self.poly_monitor = PolymarketMonitor()
-        self.poly_ws = PolymarketWSFeed()        # WebSocket book feed (primary)
+        self.poly_ws = PolymarketWSFeed()
         self.signal_engine = SignalEngine(self.price_feed)
         self.sizer = KellySizer(portfolio_value)
         self.executor = OrderExecutor(live=live)
@@ -1729,8 +1729,12 @@ class ArbBot:
         self.dashboard = Dashboard(self.db, self.price_feed, live)
         self.kill_switch = False
         self._positions: list[Position] = []
-        self.spike_cooldown = SpikeCooldown()   # ← Add this line
-        self.daily_pauser = DailyProfitPauser()   # ← Add this
+        self.spike_cooldown = SpikeCooldown()
+        self.daily_pauser = DailyProfitPauser()
+        # Per-market trade cooldown: don't re-enter same market within N seconds
+        # 5M contract = 300s window. Only one position per market per window.
+        self._market_last_trade: dict[str, float] = {}
+        self._per_market_cooldown_sec: float = 280.0  # slightly less than 5min
 
     async def _on_price_update(self, snap: PriceSnapshot):
         self.signal_engine.record_price(snap.asset, snap.price)
@@ -1754,6 +1758,11 @@ class ArbBot:
         # Per-market blacklist
         if self.db.is_blacklisted(snap.market_id):
             log.debug("Skipping blacklisted market %s", snap.market_id)
+            return
+
+        # Per-market trade cooldown — only one position per 5M contract window
+        last_trade_ts = self._market_last_trade.get(snap.market_id, 0)
+        if time.time() - last_trade_ts < self._per_market_cooldown_sec:
             return
 
         # Daily drawdown + profit ceiling
@@ -1815,35 +1824,43 @@ class ArbBot:
                 self.dashboard.positions = self._positions
                 mode = "LIVE" if self.live else "PAPER"
                 self.db.insert_trade(pos, mode)
+                self._market_last_trade[snap.market_id] = time.time()  # cooldown
                 acted = True
 
-                # Simulate close for paper trades and update market stats
+                # ── Realistic paper trade simulation ──────────────────────────
                 if pos.status == "PAPER":
-                    # Calculate real cost per token including fees and slippage
                     fee_cost  = pos.entry_price * (CONFIG.taker_fee_pct / 100.0)
                     slip_cost = pos.entry_price * (CONFIG.simulated_slippage_pct / 100.0)
                     total_cost_per_token = pos.entry_price + fee_cost + slip_cost
 
-                    # Simulate binary outcome using our fair value as probability
-                    prob_win = sig.fair_value if sig.side == "YES" else (1 - sig.fair_value)
-                    if random.random() < prob_win:
-                        pnl = (1.0 - total_cost_per_token) * pos.size_usdc   # Win
+                    # HONEST win probability:
+                    # Base = 50% (random walk). Edge adds a small bias.
+                    # e.g. 5% edge → 52.5% win rate. This is realistic.
+                    # Do NOT use fair_value directly — that would assume our
+                    # signal is perfectly calibrated, inflating paper results.
+                    edge_bonus = sig.edge_pct / 100.0 / 2.0   # half the edge as probability bonus
+                    prob_win   = min(0.5 + edge_bonus, 0.65)   # cap at 65% — no signal is better
+
+                    outcome_win = random.random() < prob_win
+                    if outcome_win:
+                        pnl = (1.0 - total_cost_per_token) * pos.size_usdc
                     else:
-                        pnl = -total_cost_per_token * pos.size_usdc           # Loss
+                        pnl = -total_cost_per_token * pos.size_usdc
                     pnl = round(pnl, 4)
 
-                    # Update database and stats
                     self.db.update_trade(pos.trade_id, "CLOSED", pnl, time.time())
                     self.db.update_market_stats(
                         pos.market_id, pos.asset, pos.direction, snap.duration, pnl
                     )
-                    self.sizer.record_result(pnl > 0)
-                    
-                    pos.pnl = pnl
+                    self.sizer.record_result(outcome_win)
+                    pos.pnl    = pnl
                     pos.status = "CLOSED"
-                    log.info("[PAPER P&L] %s %s edge=%.1f%% fee=%.2f%% slip=%.2f%% → $%.4f",
-                             sig.asset, sig.direction, sig.edge_pct,
-                             CONFIG.taker_fee_pct, CONFIG.simulated_slippage_pct, pnl)
+                    log.info(
+                        "[PAPER] %s %s %s | edge=%.1f%% p_win=%.1f%% fee=%.2f%% → $%+.4f",
+                        sig.asset, sig.direction, sig.side,
+                        sig.edge_pct, prob_win * 100,
+                        CONFIG.taker_fee_pct, pnl
+                    )
 
                 ofi = self.price_feed.ofi.get(sig.asset, 0.5)
                 msg = (
