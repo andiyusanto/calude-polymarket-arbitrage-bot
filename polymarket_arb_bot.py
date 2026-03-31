@@ -73,23 +73,22 @@ class Config:
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # === RISK-FOCUSED TUNING ===
+    # Trading parameters
     min_edge_pct: float = 3.4
     lag_threshold_pct: float = 1.6
-    max_position_pct: float = 3.8
-    confidence_threshold: float = 55.0
-    kelly_fraction: float = 0.25        # More conservative
+    max_position_pct: float = 4.0
+    confidence_threshold: float = 54.0
+    kelly_fraction: float = 0.31
 
-    # Strong Risk Management
-    kill_switch_drawdown: float = 8.0       # Tight daily drawdown
-    max_daily_loss_pct: float = 15.0        # Hard stop if losing too much
+    # Risk Management
+    kill_switch_drawdown: float = 10.0
+    max_daily_loss_pct: float = 15.0
     max_daily_profit_pct: float = 80.0
-    max_correlated_exposure: float = 12.0   # Max % in similar markets
 
     # Fee & Slippage
     taker_fee_pct: float = 1.65
     simulated_slippage_pct: float = 0.5
-    fee_buffer_pct: float = 0.8
+    fee_buffer_pct: float = 0.7
 
     # Spike cooldown
     spike_threshold_pct: float = 0.35
@@ -1281,10 +1280,10 @@ class SignalEngine:
         if ofi > 0.55: raw_prob += 0.04
         elif ofi < 0.45: raw_prob -= 0.04
 
-        raw_prob = max(0.12, min(0.88, raw_prob))
+        raw_prob = max(0.10, min(0.90, raw_prob))
         fair_value = raw_prob if direction == "UP" else (1 - raw_prob)
 
-        mom_strength = min(abs(mom_short) / 1.4, 1.0) * 54
+        mom_strength = min(abs(mom_short) / 1.4, 1.0) * 55
         ofi_bonus = 20 if abs(ofi - 0.5) > 0.10 else 10
         confidence = min(mom_strength + ofi_bonus, 100.0)
 
@@ -1296,6 +1295,10 @@ class SignalEngine:
         )
 
         edge = (fair_value - snap.yes_price) * 100 if snap.direction == "UP" else ((1 - fair_value) - snap.no_price) * 100
+
+        # Debug logging using CONFIG (no hardcode)
+        if abs(edge) >= CONFIG.min_edge_pct - 1.0 or confidence >= CONFIG.confidence_threshold - 6:
+            log.debug(f"Eval {snap.asset} {snap.direction} | Edge={edge:+.2f}% | Conf={confidence:.1f}%")
 
         if confidence < CONFIG.confidence_threshold:
             return None
@@ -1309,6 +1312,8 @@ class SignalEngine:
             side, poly_price, edge_val = "NO", snap.no_price, no_edge
         else:
             return None
+
+        log.info(f"✅ SIGNAL → {snap.asset} {snap.direction} | Edge={edge_val:+.2f}% | Conf={confidence:.1f}%")
 
         return TradeSignal(
             market_id=snap.market_id,
