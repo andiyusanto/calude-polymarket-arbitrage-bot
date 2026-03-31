@@ -73,30 +73,30 @@ class Config:
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # Trading parameters
-    min_edge_pct: float = 3.4
-    lag_threshold_pct: float = 1.6
-    max_position_pct: float = 4.0
+    # === TRADING PARAMETERS ===
+    # min_edge_pct: 2.6% = 1.65% fee + 0.7% buffer + 0.25% margin
+    min_edge_pct: float = 2.6
+    # lag_threshold_pct: Polymarket must lag CEX by at least this much
+    lag_threshold_pct: float = 1.5
+    max_position_pct: float = 5.0
+    # confidence_threshold: max possible is ~100 (45+25+30). 40 = moderate signal.
     confidence_threshold: float = 54.0
-    kelly_fraction: float = 0.31
+    kelly_fraction: float = 0.34
 
-    # Risk Management
-    kill_switch_drawdown: float = 10.0
+    kill_switch_drawdown: float = 15.0
     max_daily_loss_pct: float = 15.0
-    max_daily_profit_pct: float = 80.0
+    max_daily_profit_pct: float = 10000.0
+    daily_profit_pause_hours: float = 6.0
 
-    # Fee & Slippage
     taker_fee_pct: float = 1.65
     simulated_slippage_pct: float = 0.5
     fee_buffer_pct: float = 0.7
 
-    # Spike cooldown
     spike_threshold_pct: float = 0.35
-    spike_cooldown_sec: float = 15.0
+    spike_cooldown_sec: float = 12.0       # Shorter cooldown
 
-    # Other
     db_path: str = "trades.db"
-    order_cooldown_sec: float = 0.7
+    order_cooldown_sec: float = 0.5
     ws_reconnect_delay: float = 5.0
     max_retries: int = 5
     max_slippage_pct: float = 1.5      # Max acceptable VWAP slippage vs best price (%)
@@ -1257,35 +1257,81 @@ class SignalEngine:
 
     def __init__(self, price_feed: BinancePriceFeed):
         self.feed = price_feed
-        self._price_history: dict[str, list[float]] = {"BTC": [], "ETH": []}
+        # Store (timestamp, price) tuples for time-based windows
+        self._price_history: dict[str, list[tuple[float, float]]] = {
+            "BTC": [], "ETH": []
+        }
+        self._last_recorded: dict[str, float] = {"BTC": 0.0, "ETH": 0.0}
 
     def record_price(self, asset: str, price: float):
+        now = time.time()
+        # Downsample to at most 1 tick per second to avoid bookTicker spam
+        if now - self._last_recorded[asset] < 1.0:
+            return
+        self._last_recorded[asset] = now
+
         hist = self._price_history[asset]
-        hist.append(price)
-        if len(hist) > 1400:
+        hist.append((now, price))
+        # Keep 20 minutes of history
+        cutoff = now - 1200
+        while hist and hist[0][0] < cutoff:
             hist.pop(0)
+
+    def _price_n_seconds_ago(self, asset: str, seconds: int) -> Optional[float]:
+        """Return the price closest to N seconds ago, or None if insufficient history."""
+        hist = self._price_history[asset]
+        if not hist:
+            return None
+        target = time.time() - seconds
+        # Find closest entry
+        best = min(hist, key=lambda x: abs(x[0] - target))
+        # Only return if we actually have data near that time
+        if abs(best[0] - target) > seconds * 0.5:
+            return None
+        return best[1]
 
     def _compute_fair_value(self, asset: str, direction: str, duration: str) -> tuple[float, float]:
         hist = self._price_history[asset]
-        if len(hist) < 30:
-            return 0.5, 0.0
-
         current = self.feed.prices.get(asset, 0)
         ofi = self.feed.ofi.get(asset, 0.5)
 
-        mom_short = (current - hist[-18]) / hist[-18] * 100 if hist[-18] > 0 else 0
-        mom_med   = (current - hist[-65]) / hist[-65] * 100 if len(hist) > 65 else mom_short
+        if current == 0 or len(hist) < 30:   # need ~30 seconds of history
+            return 0.5, 0.0
 
-        raw_prob = 0.5 + (mom_short * 0.023) + (mom_med * 0.013)
-        if ofi > 0.55: raw_prob += 0.04
-        elif ofi < 0.45: raw_prob -= 0.04
+        # ── Time-based momentum windows ──────────────────────────────────────
+        # 30s = very short-term noise filter
+        # 180s = 3-min trend for 5M contracts
+        price_30s  = self._price_n_seconds_ago(asset, 30)
+        price_180s = self._price_n_seconds_ago(asset, 180)
 
-        raw_prob = max(0.10, min(0.90, raw_prob))
-        fair_value = raw_prob if direction == "UP" else (1 - raw_prob)
+        if price_30s is None or price_30s == 0:
+            return 0.5, 0.0
 
-        mom_strength = min(abs(mom_short) / 1.4, 1.0) * 55
-        ofi_bonus = 20 if abs(ofi - 0.5) > 0.10 else 10
-        confidence = min(mom_strength + ofi_bonus, 100.0)
+        mom_30s  = (current - price_30s)  / price_30s  * 100
+        mom_180s = (current - price_180s) / price_180s * 100 if price_180s else mom_30s
+
+        # Both timeframes must agree directionally
+        if mom_30s * mom_180s < 0:   # opposite signs = conflicting signal
+            return 0.5, 0.0
+
+        # ── Fair value probability (linear + OFI) ───────────────────────────
+        # 1% momentum in 30s → ~2.8% probability shift
+        raw_prob = 0.5 + (mom_30s * 0.028) + (mom_180s * 0.012)
+
+        if ofi > 0.57:
+            raw_prob += 0.04
+        elif ofi < 0.43:
+            raw_prob -= 0.04
+
+        raw_prob  = max(0.10, min(0.90, raw_prob))
+        fair_value = raw_prob if direction == "UP" else (1.0 - raw_prob)
+
+        # ── Confidence ───────────────────────────────────────────────────────
+        # Based on: momentum magnitude, OFI strength, history depth
+        mom_conf   = min(abs(mom_30s) / 0.8, 1.0) * 45    # up to 45 pts
+        ofi_conf   = 25 if abs(ofi - 0.5) > 0.10 else 10   # up to 25 pts
+        depth_conf = min(len(hist) / 60, 1.0) * 30          # up to 30 pts (1 min warmup)
+        confidence = min(mom_conf + ofi_conf + depth_conf, 100.0)
 
         return fair_value, confidence
 
@@ -1294,17 +1340,16 @@ class SignalEngine:
             snap.asset, snap.direction, snap.duration
         )
 
-        edge = (fair_value - snap.yes_price) * 100 if snap.direction == "UP" else ((1 - fair_value) - snap.no_price) * 100
-
-        # Debug logging using CONFIG (no hardcode)
-        if abs(edge) >= CONFIG.min_edge_pct - 1.0 or confidence >= CONFIG.confidence_threshold - 6:
-            log.debug(f"Eval {snap.asset} {snap.direction} | Edge={edge:+.2f}% | Conf={confidence:.1f}%")
-
         if confidence < CONFIG.confidence_threshold:
             return None
 
         yes_edge = (fair_value - snap.yes_price) * 100
         no_edge  = ((1 - fair_value) - snap.no_price) * 100
+
+        # ── Lag check: Polymarket must actually be lagging CEX ───────────────
+        lag = abs(fair_value - snap.yes_price) * 100
+        if lag < CONFIG.lag_threshold_pct:
+            return None
 
         if yes_edge >= CONFIG.min_edge_pct and yes_edge > no_edge:
             side, poly_price, edge_val = "YES", snap.yes_price, yes_edge
@@ -1313,7 +1358,9 @@ class SignalEngine:
         else:
             return None
 
-        log.info(f"✅ SIGNAL → {snap.asset} {snap.direction} | Edge={edge_val:+.2f}% | Conf={confidence:.1f}%")
+        log.debug("SIGNAL %s %s | Fair=%.4f Poly=%.4f | Edge=%+.2f%% Lag=%.2f%% Conf=%.1f%%",
+                  snap.asset, snap.direction, fair_value, snap.yes_price,
+                  edge_val, lag, confidence)
 
         return TradeSignal(
             market_id=snap.market_id,
