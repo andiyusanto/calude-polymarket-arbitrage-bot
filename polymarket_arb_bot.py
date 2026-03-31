@@ -73,11 +73,14 @@ class Config:
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # === AGGRESSIVE FREQUENCY TUNING ===
+    # === TRADING PARAMETERS ===
+    # min_edge_pct: 2.6% = 1.65% fee + 0.7% buffer + 0.25% margin
     min_edge_pct: float = 2.6
-    lag_threshold_pct: float = 1.3
+    # lag_threshold_pct: Polymarket must lag CEX by at least this much
+    lag_threshold_pct: float = 1.5
     max_position_pct: float = 5.0
-    confidence_threshold: float = 48.0     # Lowered significantly
+    # confidence_threshold: max possible is ~100 (45+25+30). 40 = moderate signal.
+    confidence_threshold: float = 40.0
     kelly_fraction: float = 0.34
 
     kill_switch_drawdown: float = 15.0
@@ -1224,37 +1227,91 @@ class PolymarketWSFeed:
 
 
 class SignalEngine:
+    """
+    Fair value engine using multi-window momentum + OFI.
+
+    Key fix: momentum windows are now in SECONDS not ticks.
+    bookTicker fires ~5-20x/sec so hist[-12] was only ~1-2 seconds.
+    We now downsample price history to 1-second intervals for meaningful windows.
+    """
+
     def __init__(self, price_feed: BinancePriceFeed):
         self.feed = price_feed
-        self._price_history: dict[str, list[float]] = {"BTC": [], "ETH": []}
+        # Store (timestamp, price) tuples for time-based windows
+        self._price_history: dict[str, list[tuple[float, float]]] = {
+            "BTC": [], "ETH": []
+        }
+        self._last_recorded: dict[str, float] = {"BTC": 0.0, "ETH": 0.0}
 
     def record_price(self, asset: str, price: float):
+        now = time.time()
+        # Downsample to at most 1 tick per second to avoid bookTicker spam
+        if now - self._last_recorded[asset] < 1.0:
+            return
+        self._last_recorded[asset] = now
+
         hist = self._price_history[asset]
-        hist.append(price)
-        if len(hist) > 1000:
+        hist.append((now, price))
+        # Keep 20 minutes of history
+        cutoff = now - 1200
+        while hist and hist[0][0] < cutoff:
             hist.pop(0)
+
+    def _price_n_seconds_ago(self, asset: str, seconds: int) -> Optional[float]:
+        """Return the price closest to N seconds ago, or None if insufficient history."""
+        hist = self._price_history[asset]
+        if not hist:
+            return None
+        target = time.time() - seconds
+        # Find closest entry
+        best = min(hist, key=lambda x: abs(x[0] - target))
+        # Only return if we actually have data near that time
+        if abs(best[0] - target) > seconds * 0.5:
+            return None
+        return best[1]
 
     def _compute_fair_value(self, asset: str, direction: str, duration: str) -> tuple[float, float]:
         hist = self._price_history[asset]
-        if len(hist) < 20:
-            return 0.5, 0.0
-
         current = self.feed.prices.get(asset, 0)
         ofi = self.feed.ofi.get(asset, 0.5)
 
-        mom_short = (current - hist[-12]) / hist[-12] * 100 if hist[-12] > 0 else 0
-        mom_med   = (current - hist[-50]) / hist[-50] * 100 if len(hist) > 50 else mom_short
+        if current == 0 or len(hist) < 30:   # need ~30 seconds of history
+            return 0.5, 0.0
 
-        raw_prob = 0.5 + (mom_short * 0.028) + (mom_med * 0.016)
-        if ofi > 0.54: raw_prob += 0.05
-        elif ofi < 0.46: raw_prob -= 0.05
+        # ── Time-based momentum windows ──────────────────────────────────────
+        # 30s = very short-term noise filter
+        # 180s = 3-min trend for 5M contracts
+        price_30s  = self._price_n_seconds_ago(asset, 30)
+        price_180s = self._price_n_seconds_ago(asset, 180)
 
-        raw_prob = max(0.08, min(0.92, raw_prob))
-        fair_value = raw_prob if direction == "UP" else (1 - raw_prob)
+        if price_30s is None or price_30s == 0:
+            return 0.5, 0.0
 
-        mom_strength = min(abs(mom_short) / 1.1, 1.0) * 50
-        ofi_bonus = 22 if abs(ofi - 0.5) > 0.08 else 10
-        confidence = min(mom_strength + ofi_bonus, 100.0)
+        mom_30s  = (current - price_30s)  / price_30s  * 100
+        mom_180s = (current - price_180s) / price_180s * 100 if price_180s else mom_30s
+
+        # Both timeframes must agree directionally
+        if mom_30s * mom_180s < 0:   # opposite signs = conflicting signal
+            return 0.5, 0.0
+
+        # ── Fair value probability (linear + OFI) ───────────────────────────
+        # 1% momentum in 30s → ~2.8% probability shift
+        raw_prob = 0.5 + (mom_30s * 0.028) + (mom_180s * 0.012)
+
+        if ofi > 0.57:
+            raw_prob += 0.04
+        elif ofi < 0.43:
+            raw_prob -= 0.04
+
+        raw_prob  = max(0.10, min(0.90, raw_prob))
+        fair_value = raw_prob if direction == "UP" else (1.0 - raw_prob)
+
+        # ── Confidence ───────────────────────────────────────────────────────
+        # Based on: momentum magnitude, OFI strength, history depth
+        mom_conf   = min(abs(mom_30s) / 0.8, 1.0) * 45    # up to 45 pts
+        ofi_conf   = 25 if abs(ofi - 0.5) > 0.10 else 10   # up to 25 pts
+        depth_conf = min(len(hist) / 60, 1.0) * 30          # up to 30 pts (1 min warmup)
+        confidence = min(mom_conf + ofi_conf + depth_conf, 100.0)
 
         return fair_value, confidence
 
@@ -1263,17 +1320,16 @@ class SignalEngine:
             snap.asset, snap.direction, snap.duration
         )
 
-        edge = (fair_value - snap.yes_price) * 100 if snap.direction == "UP" else ((1 - fair_value) - snap.no_price) * 100
-
-        # More logging for debugging
-        if abs(edge) >= 3.0:
-            log.debug(f"Eval {snap.asset} {snap.direction} | Edge={edge:+.2f}% | Conf={confidence:.1f}%")
-
         if confidence < CONFIG.confidence_threshold:
             return None
 
         yes_edge = (fair_value - snap.yes_price) * 100
         no_edge  = ((1 - fair_value) - snap.no_price) * 100
+
+        # ── Lag check: Polymarket must actually be lagging CEX ───────────────
+        lag = abs(fair_value - snap.yes_price) * 100
+        if lag < CONFIG.lag_threshold_pct:
+            return None
 
         if yes_edge >= CONFIG.min_edge_pct and yes_edge > no_edge:
             side, poly_price, edge_val = "YES", snap.yes_price, yes_edge
@@ -1281,6 +1337,10 @@ class SignalEngine:
             side, poly_price, edge_val = "NO", snap.no_price, no_edge
         else:
             return None
+
+        log.debug("SIGNAL %s %s | Fair=%.4f Poly=%.4f | Edge=%+.2f%% Lag=%.2f%% Conf=%.1f%%",
+                  snap.asset, snap.direction, fair_value, snap.yes_price,
+                  edge_val, lag, confidence)
 
         return TradeSignal(
             market_id=snap.market_id,
@@ -1683,43 +1743,41 @@ class ArbBot:
         if self.kill_switch:
             return
 
-        # Skip if in spike cooldown
+        # Daily profit pause
+        if self.daily_pauser.is_paused():
+            return
+
+        # Spike cooldown (single authoritative check)
         if self.spike_cooldown.is_in_cooldown():
             return
-        
-        # Per-market blacklist check
+
+        # Per-market blacklist
         if self.db.is_blacklisted(snap.market_id):
             log.debug("Skipping blacklisted market %s", snap.market_id)
             return
 
-        # === DAILY PROFIT TARGET CHECK (Fixed) ===
+        # Daily drawdown + profit ceiling
         daily_pnl = self.db.daily_pnl()
-        portfolio_value = self.sizer.portfolio_value
-
-        if CONFIG.max_daily_profit_pct > 0 and portfolio_value > 0:
-            profit_pct = (daily_pnl / portfolio_value) * 100
-            
-            if profit_pct >= CONFIG.max_daily_profit_pct:
-                if not hasattr(self, 'daily_pauser') or not self.daily_pauser.is_paused():
-                    if not hasattr(self, 'daily_pauser'):
-                        self.daily_pauser = DailyProfitPauser()
-                    self.daily_pauser.trigger_pause(profit_pct)
-                    msg = f"🎯 DAILY PROFIT TARGET HIT (+{profit_pct:.1f}%) — Pausing for {CONFIG.daily_profit_pause_hours} hours"
-                    log.info(msg)
+        portfolio  = self.sizer.portfolio_value
+        if portfolio > 0:
+            daily_pct = (daily_pnl / portfolio) * 100
+            if (-daily_pct) >= CONFIG.kill_switch_drawdown:
+                if not self.kill_switch:
+                    self.kill_switch = True
+                    self.dashboard.kill_switch_active = True
+                    msg = f"⛔ KILL SWITCH – Drawdown {-daily_pct:.1f}% exceeded {CONFIG.kill_switch_drawdown}%"
+                    log.critical(msg)
                     await self.notifier.send(f"*{msg}*")
-                return   # Skip trading during pause
-
-        # Skip if in spike cooldown
-        if hasattr(self, 'spike_cooldown') and self.spike_cooldown.is_in_cooldown():
-            return        
+                return
+            if CONFIG.max_daily_profit_pct > 0 and daily_pct >= CONFIG.max_daily_profit_pct:
+                self.daily_pauser.trigger_pause(daily_pct)
+                msg = f"🎯 DAILY PROFIT TARGET +{daily_pct:.1f}% — pausing {CONFIG.daily_profit_pause_hours}h"
+                log.info(msg)
+                await self.notifier.send(f"*{msg}*")
+                return
 
         sig = self.signal_engine.evaluate(snap)
         if sig is None:
-            return
-
-        # ── Spike cooldown ──────────────────────────────────────────────────
-        if self.price_feed.is_in_cooldown(sig.asset):
-            log.debug("COOLDOWN %s – skipping signal after spike", sig.asset)
             return
 
         # ── Fee-aware edge filter ───────────────────────────────────────────
