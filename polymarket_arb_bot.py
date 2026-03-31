@@ -80,11 +80,11 @@ class Config:
     lag_threshold_pct: float = 1.5
     max_position_pct: float = 5.0
     # confidence_threshold: max possible is ~100 (45+25+30). 40 = moderate signal.
-    confidence_threshold: float = 40.0
+    confidence_threshold: float = 60 #40.0
     kelly_fraction: float = 0.34
 
     kill_switch_drawdown: float = 15.0
-    max_daily_profit_pct: float = 1000.0
+    max_daily_profit_pct: float = 10000.0
     daily_profit_pause_hours: float = 6.0
 
     taker_fee_pct: float = 1.65
