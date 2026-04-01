@@ -84,7 +84,7 @@ class Config:
     kelly_fraction: float = 0.34
 
     kill_switch_drawdown: float = 15.0
-    max_daily_profit_pct: float = 10000.0
+    max_daily_profit_pct: float = 100.0
     daily_profit_pause_hours: float = 6.0
 
     taker_fee_pct: float = 1.65
@@ -1027,14 +1027,29 @@ class PolymarketMonitor:
                 last_discovery = time.time()
                 continue
 
-            # Fix 1: only REST-poll when WS is stale (>25s without message)
-            # When WS is healthy, REST is purely a no-op heartbeat
+            # Only REST-poll when WS is stale (>25s without message)
             ws_healthy = self.poly_ws.is_healthy if self.poly_ws else False
             if ws_healthy:
                 log.debug("WS healthy — skipping REST poll cycle")
             else:
-                if not ws_healthy:
-                    log.warning("WS stale — falling back to REST for one cycle")
+                # Track how long WS has been down for backoff calculation
+                ws_stale_sec = (time.time() - self.poly_ws._last_msg_time
+                                if self.poly_ws else 999)
+
+                # Exponential backoff during extended outages:
+                # 0–30s stale  → poll every 1.5s (normal)
+                # 30–60s stale → poll every 10s
+                # 60s+ stale   → poll every 30s (stop hammering CLOB)
+                if ws_stale_sec > 60:
+                    rest_interval = 30.0
+                elif ws_stale_sec > 30:
+                    rest_interval = 10.0
+                else:
+                    rest_interval = poll_interval
+
+                log.warning("WS stale (%.0fs) — REST fallback, next poll in %.0fs",
+                            ws_stale_sec, rest_interval)
+
                 active_ids = {
                     mid: meta for mid, meta in self.market_ids.items()
                     if not meta.get("end_ts") or meta["end_ts"] > time.time() + 30
@@ -1055,7 +1070,11 @@ class PolymarketMonitor:
                                 asyncio.create_task(cb(snap))
                     await asyncio.sleep(0.1)
 
-            # Fix 2: random jitter prevents synchronised rate-limit hits
+                # Use the backoff interval instead of fixed poll_interval
+                await asyncio.sleep(rest_interval + random.uniform(0.1, 0.3))
+                continue  # skip the normal sleep at the bottom
+
+            # Normal interval when WS is healthy (REST is idle)
             await asyncio.sleep(poll_interval + random.uniform(0.1, 0.3))
 
     def stop(self):
@@ -1305,6 +1324,9 @@ class PolymarketWSFeed:
 
     async def run(self):
         self._running = True
+        _reconnect_attempts = 0
+        _disconnect_time: float = 0.0
+
         while self._running:
             if not self._market_meta:
                 await asyncio.sleep(1)
@@ -1317,6 +1339,14 @@ class PolymarketWSFeed:
                     max_size=2**20,
                     additional_headers={"User-Agent": "polymarket-arb-bot/1.0"},
                 ) as ws:
+                    # Log recovery with outage duration if this was a reconnect
+                    if _disconnect_time > 0:
+                        outage_sec = time.time() - _disconnect_time
+                        log.info("✅ Polymarket WS RECONNECTED after %.0fs outage "
+                                 "(%d attempts)", outage_sec, _reconnect_attempts)
+                        _disconnect_time   = 0.0
+                        _reconnect_attempts = 0
+
                     self._ws = ws
                     self._connected = True
                     self._last_msg_time = time.time()
@@ -1330,10 +1360,18 @@ class PolymarketWSFeed:
             except (websockets.exceptions.ConnectionClosed,
                     websockets.exceptions.WebSocketException,
                     OSError) as e:
-                log.warning("Polymarket WS disconnected: %s – reconnecting in %ds",
-                            e, CONFIG.ws_reconnect_delay)
+                if _disconnect_time == 0:
+                    _disconnect_time = time.time()  # mark when outage started
+                _reconnect_attempts += 1
+                log.warning("Polymarket WS disconnected (attempt %d): %s – "
+                            "reconnecting in %ds",
+                            _reconnect_attempts, e, CONFIG.ws_reconnect_delay)
             except Exception as e:
-                log.error("Polymarket WS unexpected error: %s", e, exc_info=True)
+                if _disconnect_time == 0:
+                    _disconnect_time = time.time()
+                _reconnect_attempts += 1
+                log.error("Polymarket WS unexpected error (attempt %d): %s",
+                          _reconnect_attempts, e, exc_info=True)
             finally:
                 self._ws = None
                 self._connected = False
