@@ -1864,11 +1864,15 @@ class ArbBot:
             return
 
         # ── Atomic per-market cooldown ──────────────────────────────────────
+        # Key on asset+duration (not raw market_id) so that UP and DOWN tokens
+        # for the same underlying share a cooldown — prevents simultaneous
+        # correlated positions on e.g. ETH UP and ETH DOWN in the same window.
+        cooldown_key = f"{snap.asset}_{snap.duration}"
         async with self._market_lock:
-            last_ts = self._market_last_trade.get(snap.market_id, 0)
+            last_ts = self._market_last_trade.get(cooldown_key, 0)
             if time.time() - last_ts < self._per_market_cooldown_sec:
                 return
-            self._market_last_trade[snap.market_id] = time.time()
+            self._market_last_trade[cooldown_key] = time.time()
 
         # Slot reserved. Release in finally if no trade fires.
         acted = False
@@ -1968,7 +1972,7 @@ class ArbBot:
 
         finally:
             if not acted:
-                self._market_last_trade.pop(snap.market_id, None)
+                self._market_last_trade.pop(cooldown_key, None)
 
     async def run(self):
         mode_str = "LIVE TRADING" if self.live else "PAPER TRADING"
@@ -1976,10 +1980,20 @@ class ArbBot:
         if self.live:
             log.warning("⚠️  LIVE TRADING ENABLED – real funds at risk")
 
-        # Wire callbacks — WS feed is primary, REST monitor is fallback/discovery
+        # Wire callbacks:
+        # WS feed is always primary. REST monitor only feeds signals when WS
+        # has been silent for >25s — this prevents the dual-callback burst where
+        # both sources fire for the same snapshot within milliseconds.
         self.price_feed.on_update(self._on_price_update)
-        self.poly_ws.on_snapshot(self._on_market_snapshot)    # WS = primary
-        self.poly_monitor.on_snapshot(self._on_market_snapshot)  # REST = fallback
+        self.poly_ws.on_snapshot(self._on_market_snapshot)
+
+        async def _rest_snapshot_gate(snap: MarketSnapshot):
+            """Only forward REST snapshots when WS is confirmed stale."""
+            if self.poly_ws.is_healthy:
+                return
+            await self._on_market_snapshot(snap)
+
+        self.poly_monitor.on_snapshot(_rest_snapshot_gate)
 
         # After discovery, sync market meta to WS feed only when markets change
         async def _sync_ws_markets():
