@@ -80,11 +80,11 @@ class Config:
     lag_threshold_pct: float = 1.5
     max_position_pct: float = 5.0
     # confidence_threshold: max possible is ~100 (45+25+30). 40 = moderate signal.
-    confidence_threshold: float = 54.0
+    confidence_threshold: float = 40.0
     kelly_fraction: float = 0.34
 
     kill_switch_drawdown: float = 15.0
-    max_daily_profit_pct: float = 10000.0
+    max_daily_profit_pct: float = 100.0
     daily_profit_pause_hours: float = 6.0
 
     taker_fee_pct: float = 1.65
@@ -92,13 +92,32 @@ class Config:
     fee_buffer_pct: float = 0.7
 
     spike_threshold_pct: float = 0.35
-    spike_cooldown_sec: float = 12.0       # Shorter cooldown
+    spike_cooldown_sec: float = 12.0
 
     db_path: str = "trades.db"
     order_cooldown_sec: float = 0.5
     ws_reconnect_delay: float = 5.0
     max_retries: int = 5
-    max_slippage_pct: float = 1.5      # Max acceptable VWAP slippage vs best price (%)
+    max_slippage_pct: float = 1.5
+
+    # ── Live-only safety parameters ────────────────────────────────────────
+    # These are ignored in paper mode but enforced in live mode.
+
+    # Hard cap on single order size regardless of Kelly.
+    # Start with $10 max — raise only after 50+ live trades with positive edge.
+    live_max_order_usdc: float = 10.0
+
+    # Minimum USDC balance to keep in wallet — bot halts if balance drops here.
+    # Protects against runaway losses wiping the full account.
+    live_min_balance_usdc: float = 50.0
+
+    # Require this many confirmed filled contracts before placing next order.
+    # Prevents stacking unconfirmed orders during network issues.
+    live_require_fill_confirm: bool = True
+
+    # Extra edge required for live vs paper — accounts for real execution risk.
+    # Live effective floor = taker_fee_pct + fee_buffer_pct + live_extra_edge_pct
+    live_extra_edge_pct: float = 1.0
 
 CONFIG = Config()
 
@@ -1591,6 +1610,7 @@ class OrderExecutor:
         self.live = live
         self._client: Optional[ClobClient] = None
         self._last_order_time: float = 0.0
+        self._pending_order_id: Optional[str] = None  # tracks unconfirmed live orders
 
     def _get_client(self) -> ClobClient:
         if self._client is None:
@@ -1603,19 +1623,33 @@ class OrderExecutor:
 
     def _limit_price(self, sig: TradeSignal, snap: MarketSnapshot) -> float:
         """
-        Post a limit order at mid-price rather than hitting the ask.
-        For YES buys: mid = (best_bid + best_ask) / 2, rounded to 2 decimals.
-        For NO buys:  mid on the NO side = 1 - YES mid.
+        Post limit at mid-price — avoids paying full ask spread as taker.
+        Rounds to 2 decimal places as required by Polymarket CLOB.
         """
         if snap.asks and snap.bids:
-            best_ask = snap.asks[0][0]
-            best_bid = snap.bids[0][0]
-            yes_mid  = (best_bid + best_ask) / 2
+            yes_mid = (snap.bids[0][0] + snap.asks[0][0]) / 2
         else:
             yes_mid = sig.poly_price
-
         price = yes_mid if sig.side == "YES" else (1.0 - yes_mid)
-        return round(price, 4)
+        return round(price, 2)   # Polymarket requires 2dp, not 4dp
+
+    def _check_live_balance(self) -> Optional[float]:
+        """Fetch current USDC balance. Returns None on error."""
+        try:
+            client = self._get_client()
+            # py_clob_client balance endpoint
+            balance = client.get_balance()
+            return float(balance)
+        except Exception as e:
+            log.error("Balance check failed: %s", e)
+            return None
+
+    def _cap_size_for_live(self, size_usdc: float) -> float:
+        """
+        Apply live-specific size cap. Ignores Kelly sizing above the hard cap.
+        Start at $10 max — raise live_max_order_usdc only after proven edge.
+        """
+        return min(size_usdc, CONFIG.live_max_order_usdc)
 
     async def execute(self, sig: TradeSignal, size_usdc: float,
                       snap: Optional[MarketSnapshot] = None) -> Optional[Position]:
@@ -1624,9 +1658,10 @@ class OrderExecutor:
         if elapsed < CONFIG.order_cooldown_sec:
             await asyncio.sleep(CONFIG.order_cooldown_sec - elapsed)
 
-        trade_id   = f"{sig.market_id}-{int(time.time()*1000)}"
-        limit_price = self._limit_price(sig, snap) if snap else sig.poly_price
+        trade_id    = f"{sig.market_id}-{int(time.time()*1000)}"
+        limit_price = self._limit_price(sig, snap) if snap else round(sig.poly_price, 2)
 
+        # ── Paper mode ──────────────────────────────────────────────────────
         if not self.live:
             pos = Position(
                 trade_id=trade_id,
@@ -1640,46 +1675,127 @@ class OrderExecutor:
                 edge_at_entry=sig.edge_pct,
                 status="PAPER",
             )
-            log.info("[PAPER] LIMIT %s %s %s @ %.4f (mid)  size=$%.2f  edge=%.1f%%  conf=%.0f%%",
+            log.info("[PAPER] LIMIT %s %s %s @ %.2f  size=$%.2f  edge=%.1f%%  conf=%.0f%%",
                      sig.side, sig.asset, sig.direction,
                      limit_price, size_usdc, sig.edge_pct, sig.confidence)
             self._last_order_time = time.time()
             return pos
 
-        # Live limit order with re-entry retry (up to 3 attempts, 500ms apart)
-        for attempt in range(CONFIG.max_retries):
+        # ── Live mode ────────────────────────────────────────────────────────
+
+        # 1. Block if a previous order is still unconfirmed
+        if CONFIG.live_require_fill_confirm and self._pending_order_id:
+            log.warning("LIVE: previous order %s still pending — skipping new order",
+                        self._pending_order_id)
+            return None
+
+        # 2. Balance check — halt if below minimum reserve
+        balance = self._check_live_balance()
+        if balance is None:
+            log.error("LIVE: cannot verify balance — skipping order for safety")
+            return None
+        if balance < CONFIG.live_min_balance_usdc:
+            log.critical("LIVE: balance $%.2f below minimum $%.2f — HALTING",
+                         balance, CONFIG.live_min_balance_usdc)
+            return None
+
+        # 3. Apply hard size cap — Kelly may suggest large sizes, cap it
+        capped_size = self._cap_size_for_live(size_usdc)
+        if capped_size < 1.0:
+            log.debug("LIVE: capped size $%.2f too small after cap", capped_size)
+            return None
+
+        # 4. Apply extra edge requirement for live execution
+        live_edge_floor = (CONFIG.taker_fee_pct + CONFIG.fee_buffer_pct
+                           + CONFIG.live_extra_edge_pct)
+        if sig.edge_pct < live_edge_floor:
+            log.info("LIVE: edge %.1f%% below live floor %.1f%% — skipping",
+                     sig.edge_pct, live_edge_floor)
+            return None
+
+        # 5. Place the order with retry
+        for attempt in range(3):   # max 3 attempts for live — don't chase
             try:
-                client  = self._get_client()
-                loop    = asyncio.get_running_loop()
+                client = self._get_client()
+                loop   = asyncio.get_running_loop()
                 order_args = OrderArgs(
                     token_id=sig.market_id,
                     price=limit_price,
-                    size=size_usdc,
+                    size=capped_size,
                     side="BUY",
                 )
                 resp = await loop.run_in_executor(
                     None, lambda: client.create_and_post_order(order_args)
                 )
-                log.info("[LIVE] Limit order placed @ %.4f: %s", limit_price, resp)
-                self._last_order_time = time.time()
-                return Position(
+
+                order_id = resp.get("orderID") or resp.get("id") or str(resp)
+                self._pending_order_id = order_id
+                self._last_order_time  = time.time()
+
+                log.info("[LIVE] Order placed | %s %s %s @ %.2f | size=$%.2f | "
+                         "edge=%.1f%% | id=%s | balance_before=$%.2f",
+                         sig.side, sig.asset, sig.direction,
+                         limit_price, capped_size, sig.edge_pct,
+                         order_id[:16] if order_id else "?", balance)
+
+                pos = Position(
                     trade_id=trade_id,
                     market_id=sig.market_id,
                     asset=sig.asset,
                     direction=sig.direction,
                     side=sig.side,
                     entry_price=limit_price,
-                    size_usdc=size_usdc,
+                    size_usdc=capped_size,
                     fair_value_at_entry=sig.fair_value,
                     edge_at_entry=sig.edge_pct,
                     status="OPEN",
                 )
+
+                # Attempt fill confirmation (non-blocking — continues on timeout)
+                if CONFIG.live_require_fill_confirm:
+                    await self._confirm_fill(order_id, timeout_sec=8.0)
+
+                return pos
+
             except Exception as e:
-                backoff = 0.5 if attempt < 3 else 2 ** attempt
-                log.error("Order failed (attempt %d): %s – retry in %.1fs", attempt + 1, e, backoff)
+                backoff = 0.5 * (attempt + 1)
+                log.error("[LIVE] Order attempt %d failed: %s — retry in %.1fs",
+                          attempt + 1, e, backoff)
                 await asyncio.sleep(backoff)
 
+        log.error("[LIVE] All order attempts failed for %s %s", sig.asset, sig.direction)
         return None
+
+    async def _confirm_fill(self, order_id: str, timeout_sec: float = 8.0):
+        """
+        Poll for fill confirmation. Clears _pending_order_id when confirmed.
+        Non-fatal if it times out — order may still fill later.
+        """
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            try:
+                client = self._get_client()
+                loop   = asyncio.get_running_loop()
+                order  = await loop.run_in_executor(
+                    None, lambda: client.get_order(order_id)
+                )
+                status = order.get("status", "").upper()
+                if status in ("MATCHED", "FILLED", "MINED"):
+                    log.info("[LIVE] Order %s confirmed: %s", order_id[:16], status)
+                    self._pending_order_id = None
+                    return
+                elif status in ("CANCELLED", "REJECTED", "UNMATCHED"):
+                    log.warning("[LIVE] Order %s status: %s — clearing pending",
+                                order_id[:16], status)
+                    self._pending_order_id = None
+                    return
+            except Exception as e:
+                log.debug("Fill confirm poll error: %s", e)
+            await asyncio.sleep(1.0)
+
+        log.warning("[LIVE] Fill confirm timed out for %s — may still fill",
+                    order_id[:16] if order_id else "?")
+        # Don't clear pending_order_id on timeout — keeps guard active
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1896,7 +2012,9 @@ class ArbBot:
                 return
 
             # ── Fee-aware edge filter ───────────────────────────────────────
-            net_edge_floor = CONFIG.taker_fee_pct + CONFIG.fee_buffer_pct
+            # Live mode adds extra_edge_pct on top to account for execution risk.
+            live_extra  = CONFIG.live_extra_edge_pct if self.live else 0.0
+            net_edge_floor = CONFIG.taker_fee_pct + CONFIG.fee_buffer_pct + live_extra
             effective_min  = max(CONFIG.min_edge_pct, net_edge_floor)
             if sig.edge_pct < effective_min:
                 log.debug("EDGE BELOW FLOOR %.1f%% (need %.1f%%): %s %s",
