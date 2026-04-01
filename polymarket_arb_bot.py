@@ -80,11 +80,11 @@ class Config:
     lag_threshold_pct: float = 1.5
     max_position_pct: float = 5.0
     # confidence_threshold: max possible is ~100 (45+25+30). 40 = moderate signal.
-    confidence_threshold: float = 40.0
+    confidence_threshold: float = 55.0
     kelly_fraction: float = 0.34
 
     kill_switch_drawdown: float = 15.0
-    max_daily_profit_pct: float = 10000.0
+    max_daily_profit_pct: float = 100.0
     daily_profit_pause_hours: float = 6.0
 
     taker_fee_pct: float = 1.65
@@ -103,16 +103,122 @@ class Config:
 CONFIG = Config()
 
 
-class DailyProfitPauser:
-    def __init__(self):
-        self.pause_until: float = 0.0
 
-    def is_paused(self) -> bool:
-        return time.time() < self.pause_until
+# ═══════════════════════════════════════════════════════════════════════════
+# Risk Manager — single authoritative source for all risk decisions
+# ═══════════════════════════════════════════════════════════════════════════
 
-    def trigger_pause(self, profit_pct: float):
-        self.pause_until = time.time() + (CONFIG.daily_profit_pause_hours * 3600)
-        log.info(f"🎯 DAILY PROFIT TARGET HIT (+{profit_pct:.1f}%) — Pausing for {CONFIG.daily_profit_pause_hours} hours")
+class RiskManager:
+    """
+    Single gate for all risk decisions. Replaces the scattered kill_switch,
+    DailyProfitPauser, and drawdown checks that were duplicated across ArbBot.
+
+    Call can_trade() before any execution. Call record_trade() / record_close()
+    to track live exposure. Call update_portfolio() after each paper P&L
+    so the sizer works off the current balance, not the original starting value.
+    """
+
+    MAX_ASSET_EXPOSURE_PCT: float = 20.0  # max % of portfolio in one asset at once
+
+    def __init__(self, portfolio_value: float):
+        self.portfolio_value       = max(portfolio_value, 1.0)
+        self._loss_limit_hit       = False
+        self._profit_limit_hit     = False
+        self._asset_exposure: dict[str, float] = {"BTC": 0.0, "ETH": 0.0}
+        self._reset_day: int       = datetime.utcnow().toordinal()
+        self._notified_loss        = False
+        self._notified_profit      = False
+
+    # ── Internal ────────────────────────────────────────────────────────────
+
+    def _check_day_reset(self):
+        """Reset daily flags at UTC midnight automatically."""
+        today = datetime.utcnow().toordinal()
+        if today != self._reset_day:
+            self._loss_limit_hit   = False
+            self._profit_limit_hit = False
+            self._notified_loss    = False
+            self._notified_profit  = False
+            self._reset_day        = today
+            log.info("RiskManager: daily limits reset for new UTC day")
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    def can_trade(self, asset: str, size_usdc: float,
+                  daily_pnl: float) -> tuple[bool, str]:
+        """
+        Returns (allowed, reason).
+        'reason' is empty string when allowed, descriptive when blocked.
+        """
+        self._check_day_reset()
+
+        if self.portfolio_value <= 0:
+            return False, "portfolio value is zero"
+
+        # ── Already hit limits ───────────────────────────────────────────────
+        if self._loss_limit_hit:
+            return False, "daily loss limit already hit"
+        if self._profit_limit_hit:
+            return False, "daily profit target already hit"
+
+        # ── Daily drawdown check ─────────────────────────────────────────────
+        if daily_pnl < 0:
+            loss_pct = abs(daily_pnl) / self.portfolio_value * 100
+            if loss_pct >= CONFIG.kill_switch_drawdown:
+                self._loss_limit_hit = True
+                log.critical("🚨 DAILY LOSS LIMIT %.1f%% HIT — halting all trading", loss_pct)
+                return False, f"daily loss {loss_pct:.1f}%"
+
+        # ── Daily profit ceiling ─────────────────────────────────────────────
+        if daily_pnl > 0 and CONFIG.max_daily_profit_pct > 0:
+            profit_pct = daily_pnl / self.portfolio_value * 100
+            if profit_pct >= CONFIG.max_daily_profit_pct:
+                self._profit_limit_hit = True
+                log.info("🎯 DAILY PROFIT %.1f%% TARGET HIT — pausing trading", profit_pct)
+                return False, f"daily profit {profit_pct:.1f}%"
+
+        # ── Per-asset exposure cap ───────────────────────────────────────────
+        current_pct = self._asset_exposure.get(asset, 0.0)
+        new_pct     = size_usdc / self.portfolio_value * 100
+        if current_pct + new_pct > self.MAX_ASSET_EXPOSURE_PCT:
+            return False, (f"{asset} exposure {current_pct:.1f}%"
+                           f" + {new_pct:.1f}% > cap {self.MAX_ASSET_EXPOSURE_PCT}%")
+
+        return True, ""
+
+    def record_trade(self, asset: str, size_usdc: float):
+        """Call immediately after a position is opened."""
+        self._asset_exposure[asset] = (
+            self._asset_exposure.get(asset, 0.0)
+            + size_usdc / self.portfolio_value * 100
+        )
+        log.debug("RiskManager: %s exposure now %.1f%%",
+                  asset, self._asset_exposure[asset])
+
+    def record_close(self, asset: str, size_usdc: float):
+        """Call when a position closes to release exposure."""
+        self._asset_exposure[asset] = max(
+            0.0,
+            self._asset_exposure.get(asset, 0.0)
+            - size_usdc / self.portfolio_value * 100
+        )
+
+    def update_portfolio(self, pnl: float):
+        """
+        Adjust portfolio value by realised P&L so future sizing is honest.
+        Without this, the sizer always works off the original $1,000 even
+        after significant losses, overstating available capital.
+        """
+        self.portfolio_value = max(self.portfolio_value + pnl, 1.0)
+
+    @property
+    def loss_limit_hit(self) -> bool:
+        return self._loss_limit_hit
+
+    @property
+    def profit_limit_hit(self) -> bool:
+        return self._profit_limit_hit
+
 
 class SpikeCooldown:
     def __init__(self):
@@ -1727,14 +1833,16 @@ class ArbBot:
         self.executor = OrderExecutor(live=live)
         self.notifier = TelegramNotifier(CONFIG.telegram_token, CONFIG.telegram_chat_id)
         self.dashboard = Dashboard(self.db, self.price_feed, live)
-        self.kill_switch = False
         self._positions: list[Position] = []
         self.spike_cooldown = SpikeCooldown()
-        self.daily_pauser = DailyProfitPauser()
-        # Per-market trade cooldown: don't re-enter same market within N seconds
-        # 5M contract = 300s window. Only one position per market per window.
+
+        # Single authoritative risk gate — replaces kill_switch + DailyProfitPauser
+        self.risk = RiskManager(portfolio_value)
+
+        # Per-market cooldown with asyncio.Lock for race-condition safety
         self._market_last_trade: dict[str, float] = {}
-        self._per_market_cooldown_sec: float = 280.0  # slightly less than 5min
+        self._per_market_cooldown_sec: float = 280.0
+        self._market_lock = asyncio.Lock()
 
     async def _on_price_update(self, snap: PriceSnapshot):
         self.signal_engine.record_price(snap.asset, snap.price)
@@ -1744,136 +1852,127 @@ class ArbBot:
             self.spike_cooldown.check_and_update(snap.change_pct)
 
     async def _on_market_snapshot(self, snap: MarketSnapshot):
-        if self.kill_switch:
+        # ── Fast-path guards (no lock, no DB) ──────────────────────────────
+        if self.risk.loss_limit_hit:
             return
-
-        # Daily profit pause
-        if self.daily_pauser.is_paused():
+        if self.risk.profit_limit_hit:
             return
-
-        # Spike cooldown (single authoritative check)
         if self.spike_cooldown.is_in_cooldown():
             return
-
-        # Per-market blacklist
         if self.db.is_blacklisted(snap.market_id):
             log.debug("Skipping blacklisted market %s", snap.market_id)
             return
 
-        # Per-market trade cooldown — only one position per 5M contract window
-        last_trade_ts = self._market_last_trade.get(snap.market_id, 0)
-        if time.time() - last_trade_ts < self._per_market_cooldown_sec:
-            return
-
-        # Daily drawdown + profit ceiling
-        daily_pnl = self.db.daily_pnl()
-        portfolio  = self.sizer.portfolio_value
-        if portfolio > 0:
-            daily_pct = (daily_pnl / portfolio) * 100
-            if (-daily_pct) >= CONFIG.kill_switch_drawdown:
-                if not self.kill_switch:
-                    self.kill_switch = True
-                    self.dashboard.kill_switch_active = True
-                    msg = f"⛔ KILL SWITCH – Drawdown {-daily_pct:.1f}% exceeded {CONFIG.kill_switch_drawdown}%"
-                    log.critical(msg)
-                    await self.notifier.send(f"*{msg}*")
+        # ── Atomic per-market cooldown ──────────────────────────────────────
+        # Key on asset+duration (not raw market_id) so that UP and DOWN tokens
+        # for the same underlying share a cooldown — prevents simultaneous
+        # correlated positions on e.g. ETH UP and ETH DOWN in the same window.
+        cooldown_key = f"{snap.asset}_{snap.duration}"
+        async with self._market_lock:
+            last_ts = self._market_last_trade.get(cooldown_key, 0)
+            if time.time() - last_ts < self._per_market_cooldown_sec:
                 return
-            if CONFIG.max_daily_profit_pct > 0 and daily_pct >= CONFIG.max_daily_profit_pct:
-                self.daily_pauser.trigger_pause(daily_pct)
-                msg = f"🎯 DAILY PROFIT TARGET +{daily_pct:.1f}% — pausing {CONFIG.daily_profit_pause_hours}h"
-                log.info(msg)
-                await self.notifier.send(f"*{msg}*")
-                return
+            self._market_last_trade[cooldown_key] = time.time()
 
-        sig = self.signal_engine.evaluate(snap)
-        if sig is None:
-            return
-
-        # ── Fee-aware edge filter ───────────────────────────────────────────
-        # Net edge must exceed taker fee + buffer to be worth trading.
-        # This replaces the raw min_edge_pct check — we still keep min_edge_pct
-        # as a secondary floor for very low-fee scenarios.
-        net_edge_floor = CONFIG.taker_fee_pct + CONFIG.fee_buffer_pct
-        effective_min  = max(CONFIG.min_edge_pct, net_edge_floor)
-        if sig.edge_pct < effective_min:
-            log.debug("EDGE BELOW FEE FLOOR %.1f%% (need %.1f%%): %s %s",
-                      sig.edge_pct, effective_min, sig.asset, sig.direction)
-            return
-
-        size = self.sizer.size(sig)
-        if size < 1.0:
-            return
-
-        # ── Slippage guard ─────────────────────────────────────────────────
-        slip = SlippageGuard.check(snap, sig.side, size)
-        if not slip.passes:
-            log.info(
-                "SLIPPAGE REJECTED %s %s %s – slippage=%.2f%% (max %.2f%%), "
-                "fillable=$%.2f of $%.2f",
-                sig.asset, sig.direction, sig.side,
-                slip.slippage_pct, CONFIG.max_slippage_pct,
-                slip.fillable_usdc, size,
-            )
-            return
-
+        # Slot reserved. Release in finally if no trade fires.
         acted = False
-        if sig.edge_pct >= CONFIG.min_edge_pct and sig.confidence >= CONFIG.confidence_threshold:
-            pos = await self.executor.execute(sig, size, snap=snap)
-            if pos:
-                self._positions.append(pos)
-                self.dashboard.positions = self._positions
-                mode = "LIVE" if self.live else "PAPER"
-                self.db.insert_trade(pos, mode)
-                self._market_last_trade[snap.market_id] = time.time()  # cooldown
-                acted = True
+        try:
+            # ── Risk gate (daily loss / profit / exposure) ──────────────────
+            daily_pnl = self.db.daily_pnl()
+            size_estimate = self.sizer.portfolio_value * CONFIG.max_position_pct / 100
+            allowed, reason = self.risk.can_trade(snap.asset, size_estimate, daily_pnl)
+            if not allowed:
+                if "loss" in reason and not self.dashboard.kill_switch_active:
+                    self.dashboard.kill_switch_active = True
+                    await self.notifier.send(f"*⛔ RISK GATE: {reason}*")
+                elif "profit" in reason:
+                    await self.notifier.send(f"*🎯 RISK GATE: {reason}*")
+                log.info("RISK GATE blocked %s %s: %s", snap.asset, snap.direction, reason)
+                return
 
-                # ── Realistic paper trade simulation ──────────────────────────
-                if pos.status == "PAPER":
-                    fee_cost  = pos.entry_price * (CONFIG.taker_fee_pct / 100.0)
-                    slip_cost = pos.entry_price * (CONFIG.simulated_slippage_pct / 100.0)
-                    total_cost_per_token = pos.entry_price + fee_cost + slip_cost
+            # ── Signal evaluation ───────────────────────────────────────────
+            sig = self.signal_engine.evaluate(snap)
+            if sig is None:
+                return
 
-                    # HONEST win probability:
-                    # Base = 50% (random walk). Edge adds a small bias.
-                    # e.g. 5% edge → 52.5% win rate. This is realistic.
-                    # Do NOT use fair_value directly — that would assume our
-                    # signal is perfectly calibrated, inflating paper results.
-                    edge_bonus = sig.edge_pct / 100.0 / 2.0   # half the edge as probability bonus
-                    prob_win   = min(0.5 + edge_bonus, 0.65)   # cap at 65% — no signal is better
+            # ── Fee-aware edge filter ───────────────────────────────────────
+            net_edge_floor = CONFIG.taker_fee_pct + CONFIG.fee_buffer_pct
+            effective_min  = max(CONFIG.min_edge_pct, net_edge_floor)
+            if sig.edge_pct < effective_min:
+                log.debug("EDGE BELOW FLOOR %.1f%% (need %.1f%%): %s %s",
+                          sig.edge_pct, effective_min, sig.asset, sig.direction)
+                return
 
-                    outcome_win = random.random() < prob_win
-                    if outcome_win:
-                        pnl = (1.0 - total_cost_per_token) * pos.size_usdc
-                    else:
-                        pnl = -total_cost_per_token * pos.size_usdc
-                    pnl = round(pnl, 4)
+            size = self.sizer.size(sig)
+            if size < 1.0:
+                return
 
-                    self.db.update_trade(pos.trade_id, "CLOSED", pnl, time.time())
-                    self.db.update_market_stats(
-                        pos.market_id, pos.asset, pos.direction, snap.duration, pnl
+            # ── Re-check exposure with actual size ──────────────────────────
+            allowed, reason = self.risk.can_trade(snap.asset, size, daily_pnl)
+            if not allowed:
+                log.debug("EXPOSURE BLOCKED %s: %s", snap.asset, reason)
+                return
+
+            # ── Slippage guard ──────────────────────────────────────────────
+            slip = SlippageGuard.check(snap, sig.side, size)
+            if not slip.passes:
+                log.info("SLIPPAGE REJECTED %s %s %s – %.2f%% > max %.2f%%",
+                         sig.asset, sig.direction, sig.side,
+                         slip.slippage_pct, CONFIG.max_slippage_pct)
+                return
+
+            # ── Execute ─────────────────────────────────────────────────────
+            if sig.edge_pct >= CONFIG.min_edge_pct and sig.confidence >= CONFIG.confidence_threshold:
+                pos = await self.executor.execute(sig, size, snap=snap)
+                if pos:
+                    self._positions.append(pos)
+                    self.dashboard.positions = self._positions
+                    mode = "LIVE" if self.live else "PAPER"
+                    self.db.insert_trade(pos, mode)
+                    self.risk.record_trade(sig.asset, size)
+                    acted = True
+
+                    # ── Paper simulation ────────────────────────────────────
+                    if pos.status == "PAPER":
+                        fee_cost   = pos.entry_price * (CONFIG.taker_fee_pct / 100.0)
+                        slip_cost  = pos.entry_price * (CONFIG.simulated_slippage_pct / 100.0)
+                        total_cost = pos.entry_price + fee_cost + slip_cost
+
+                        edge_bonus  = sig.edge_pct / 100.0 / 2.0
+                        prob_win    = min(0.5 + edge_bonus, 0.65)
+                        outcome_win = random.random() < prob_win
+
+                        pnl = ((1.0 - total_cost) if outcome_win else -total_cost) * pos.size_usdc
+                        pnl = round(pnl, 4)
+
+                        self.db.update_trade(pos.trade_id, "CLOSED", pnl, time.time())
+                        self.db.update_market_stats(
+                            pos.market_id, pos.asset, pos.direction, snap.duration, pnl
+                        )
+                        self.sizer.record_result(outcome_win)
+                        self.risk.record_close(sig.asset, size)
+                        self.risk.update_portfolio(pnl)   # keep sizer honest
+                        pos.pnl    = pnl
+                        pos.status = "CLOSED"
+                        log.info("[PAPER] %s %s %s | edge=%.1f%% p_win=%.1f%% → $%+.4f",
+                                 sig.asset, sig.direction, sig.side,
+                                 sig.edge_pct, prob_win * 100, pnl)
+
+                    ofi = self.price_feed.ofi.get(sig.asset, 0.5)
+                    await self.notifier.send(
+                        f"{'🟢' if self.live else '📋'} "
+                        f"*{'LIVE' if self.live else 'PAPER'} TRADE*\n"
+                        f"Market: {sig.asset} {sig.direction} {snap.duration}\n"
+                        f"Side: {sig.side} @ {pos.entry_price:.4f}  VWAP={slip.vwap:.4f}\n"
+                        f"Edge: {sig.edge_pct:.1f}%  Conf: {sig.confidence:.0f}%\n"
+                        f"OFI: {ofi:.2f}  Size: ${size:.2f}"
                     )
-                    self.sizer.record_result(outcome_win)
-                    pos.pnl    = pnl
-                    pos.status = "CLOSED"
-                    log.info(
-                        "[PAPER] %s %s %s | edge=%.1f%% p_win=%.1f%% fee=%.2f%% → $%+.4f",
-                        sig.asset, sig.direction, sig.side,
-                        sig.edge_pct, prob_win * 100,
-                        CONFIG.taker_fee_pct, pnl
-                    )
 
-                ofi = self.price_feed.ofi.get(sig.asset, 0.5)
-                msg = (
-                    f"{'🟢' if self.live else '📋'} *{'LIVE' if self.live else 'PAPER'} TRADE*\n"
-                    f"Market: {sig.asset} {sig.direction} {snap.duration}\n"
-                    f"Side: {sig.side} @ limit={pos.entry_price:.4f}  (VWAP={slip.vwap:.4f})\n"
-                    f"Slippage: {slip.slippage_pct:.2f}%  Edge: {sig.edge_pct:.1f}%\n"
-                    f"Fair Value: {sig.fair_value:.4f}  Confidence: {sig.confidence:.0f}%\n"
-                    f"OFI: {ofi:.2f}  Size: ${size:.2f}"
-                )
-                await self.notifier.send(msg)
+            self.db.log_signal(sig, acted)
 
-        self.db.log_signal(sig, acted)
+        finally:
+            if not acted:
+                self._market_last_trade.pop(cooldown_key, None)
 
     async def run(self):
         mode_str = "LIVE TRADING" if self.live else "PAPER TRADING"
@@ -1881,10 +1980,20 @@ class ArbBot:
         if self.live:
             log.warning("⚠️  LIVE TRADING ENABLED – real funds at risk")
 
-        # Wire callbacks — WS feed is primary, REST monitor is fallback/discovery
+        # Wire callbacks:
+        # WS feed is always primary. REST monitor only feeds signals when WS
+        # has been silent for >25s — this prevents the dual-callback burst where
+        # both sources fire for the same snapshot within milliseconds.
         self.price_feed.on_update(self._on_price_update)
-        self.poly_ws.on_snapshot(self._on_market_snapshot)    # WS = primary
-        self.poly_monitor.on_snapshot(self._on_market_snapshot)  # REST = fallback
+        self.poly_ws.on_snapshot(self._on_market_snapshot)
+
+        async def _rest_snapshot_gate(snap: MarketSnapshot):
+            """Only forward REST snapshots when WS is confirmed stale."""
+            if self.poly_ws.is_healthy:
+                return
+            await self._on_market_snapshot(snap)
+
+        self.poly_monitor.on_snapshot(_rest_snapshot_gate)
 
         # After discovery, sync market meta to WS feed only when markets change
         async def _sync_ws_markets():
