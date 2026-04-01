@@ -1623,15 +1623,37 @@ class OrderExecutor:
 
     def _limit_price(self, sig: TradeSignal, snap: MarketSnapshot) -> float:
         """
-        Post limit at mid-price — avoids paying full ask spread as taker.
-        Rounds to 2 decimal places as required by Polymarket CLOB.
+        Post limit slightly inside the spread from yes_price.
+
+        Problem with raw mid-price: when best_bid is stale or the book is thin,
+        mid can be far below yes_price (e.g. 0.16 on a 0.50 contract).
+        That price would never fill in real Polymarket — it just sits in the book.
+
+        Fix: start from yes_price (the WS best_bid_ask mid), then offer a small
+        discount of up to 1 tick (0.01) to improve fill probability while staying
+        realistic. Never more than 0.02 below yes_price.
         """
-        if snap.asks and snap.bids:
-            yes_mid = (snap.bids[0][0] + snap.asks[0][0]) / 2
+        # yes_price from the snapshot is already (best_bid + best_ask) / 2
+        # from the WS best_bid_ask event — use it as the anchor
+        if snap.yes_price > 0:
+            anchor = snap.yes_price
+        elif snap.asks and snap.bids:
+            anchor = (snap.bids[0][0] + snap.asks[0][0]) / 2
         else:
-            yes_mid = sig.poly_price
-        price = yes_mid if sig.side == "YES" else (1.0 - yes_mid)
-        return round(price, 2)   # Polymarket requires 2dp, not 4dp
+            anchor = sig.poly_price
+
+        # Offer 1 tick inside to improve fill rate without straying far from fair
+        if sig.side == "YES":
+            price = anchor - 0.01          # bid 1 tick below yes mid
+        else:
+            price = (1.0 - anchor) - 0.01  # bid 1 tick below no mid
+
+        # Hard clamp: never more than 0.02 below the anchor price.
+        # This prevents stale/thin books from producing 0.16 entries on 0.50 contracts.
+        min_price = (anchor - 0.02) if sig.side == "YES" else ((1.0 - anchor) - 0.02)
+        price = max(price, min_price, 0.01)
+
+        return round(price, 2)
 
     def _check_live_balance(self) -> Optional[float]:
         """Fetch current USDC balance. Returns None on error."""
