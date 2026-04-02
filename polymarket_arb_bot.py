@@ -76,15 +76,16 @@ class Config:
     # === TRADING PARAMETERS ===
     # min_edge_pct: 2.6% = 1.65% fee + 0.7% buffer + 0.25% margin
     min_edge_pct: float = 2.6
-    # lag_threshold_pct: Polymarket must lag CEX by at least this much
-    lag_threshold_pct: float = 1.5
+    # lag_threshold_pct: raised to 2.5% — only trade genuine mispricings,
+    # not the noisy 1.5–2.5% range that showed ~49% win rate in clean data
+    lag_threshold_pct: float = 2.5
     max_position_pct: float = 5.0
     # confidence_threshold: max possible is ~100 (45+25+30). 40 = moderate signal.
     confidence_threshold: float = 40.0
     kelly_fraction: float = 0.34
 
     kill_switch_drawdown: float = 15.0
-    max_daily_profit_pct: float = 10000.0
+    max_daily_profit_pct: float = 100.0
     daily_profit_pause_hours: float = 6.0
 
     taker_fee_pct: float = 1.65
@@ -99,6 +100,22 @@ class Config:
     ws_reconnect_delay: float = 5.0
     max_retries: int = 5
     max_slippage_pct: float = 1.5
+
+    # ── Signal quality filters ─────────────────────────────────────────────
+    # Directions to trade. Data shows BTC DOWN and ETH UP are consistently
+    # weaker signals. Set to None to trade all directions.
+    # Format: set of "ASSET_DIRECTION" strings.
+    allowed_signals: frozenset = frozenset({
+        "BTC_UP",    # strongest: 54–60% win rate across reports
+        "ETH_DOWN",  # second strongest: 51–62% win rate
+        # "BTC_DOWN" excluded: 41–58%, high variance, net negative in clean data
+        # "ETH_UP"   excluded: 42–55%, inconsistent across reports
+    })
+
+    # Minimum absolute 30-second momentum to fire a signal.
+    # Filters out low-momentum noise signals that cluster near 49% win rate.
+    # 0.3% means BTC must have moved at least $200 in the last 30s (at $67k).
+    min_momentum_pct: float = 0.3
 
     # ── Live-only safety parameters ────────────────────────────────────────
     # These are ignored in paper mode but enforced in live mode.
@@ -1391,119 +1408,163 @@ class PolymarketWSFeed:
 
 class SignalEngine:
     """
-    Fair value engine using multi-window momentum + OFI.
+    Fair value engine using time-based momentum + OFI.
 
-    Key fix: momentum windows are now in SECONDS not ticks.
-    bookTicker fires ~5-20x/sec so hist[-12] was only ~1-2 seconds.
-    We now downsample price history to 1-second intervals for meaningful windows.
+    Three signal quality filters added based on paper trading data analysis:
+      1. Direction filter  — only trade BTC_UP and ETH_DOWN (data-driven)
+      2. Min momentum      — require abs(mom_30s) >= 0.3% to avoid noise
+      3. Lag threshold 2.5% — only trade genuine mispricings, not marginal lag
     """
 
     def __init__(self, price_feed: BinancePriceFeed):
         self.feed = price_feed
-        # Store (timestamp, price) tuples for time-based windows
         self._price_history: dict[str, list[tuple[float, float]]] = {
             "BTC": [], "ETH": []
         }
         self._last_recorded: dict[str, float] = {"BTC": 0.0, "ETH": 0.0}
 
+        # Track filter rejection reasons for debugging
+        self._filter_counts: dict[str, int] = {
+            "direction": 0, "momentum": 0, "timeframe": 0,
+            "lag": 0, "edge": 0, "confidence": 0,
+        }
+        self._last_filter_log: float = 0.0
+
     def record_price(self, asset: str, price: float):
         now = time.time()
-        # Downsample to at most 1 tick per second to avoid bookTicker spam
         if now - self._last_recorded[asset] < 1.0:
             return
         self._last_recorded[asset] = now
-
         hist = self._price_history[asset]
         hist.append((now, price))
-        # Keep 20 minutes of history
-        cutoff = now - 1200
+        cutoff = now - 1200   # keep 20 minutes
         while hist and hist[0][0] < cutoff:
             hist.pop(0)
 
     def _price_n_seconds_ago(self, asset: str, seconds: int) -> Optional[float]:
-        """Return the price closest to N seconds ago, or None if insufficient history."""
         hist = self._price_history[asset]
         if not hist:
             return None
         target = time.time() - seconds
-        # Find closest entry
         best = min(hist, key=lambda x: abs(x[0] - target))
-        # Only return if we actually have data near that time
         if abs(best[0] - target) > seconds * 0.5:
             return None
         return best[1]
 
-    def _compute_fair_value(self, asset: str, direction: str, duration: str) -> tuple[float, float]:
+    def _log_filter_stats(self):
+        """Log filter rejection counts every 10 minutes for tuning insight."""
+        now = time.time()
+        if now - self._last_filter_log < 600:
+            return
+        self._last_filter_log = now
+        total = sum(self._filter_counts.values())
+        if total == 0:
+            return
+        stats = " | ".join(f"{k}={v}" for k, v in self._filter_counts.items() if v > 0)
+        log.info("Signal filters (last 10min): %s | total_rejected=%d", stats, total)
+        self._filter_counts = {k: 0 for k in self._filter_counts}
+
+    def _compute_fair_value(self, asset: str, direction: str,
+                             duration: str) -> tuple[float, float, float]:
+        """
+        Returns (fair_value, confidence, mom_30s).
+        mom_30s is returned separately so evaluate() can apply the momentum filter
+        without recomputing it.
+        """
         hist = self._price_history[asset]
         current = self.feed.prices.get(asset, 0)
         ofi = self.feed.ofi.get(asset, 0.5)
 
-        if current == 0 or len(hist) < 30:   # need ~30 seconds of history
-            return 0.5, 0.0
+        if current == 0 or len(hist) < 30:
+            return 0.5, 0.0, 0.0
 
-        # ── Time-based momentum windows ──────────────────────────────────────
-        # 30s = very short-term noise filter
-        # 180s = 3-min trend for 5M contracts
         price_30s  = self._price_n_seconds_ago(asset, 30)
         price_180s = self._price_n_seconds_ago(asset, 180)
 
         if price_30s is None or price_30s == 0:
-            return 0.5, 0.0
+            return 0.5, 0.0, 0.0
 
         mom_30s  = (current - price_30s)  / price_30s  * 100
         mom_180s = (current - price_180s) / price_180s * 100 if price_180s else mom_30s
 
         # Both timeframes must agree directionally
-        if mom_30s * mom_180s < 0:   # opposite signs = conflicting signal
-            return 0.5, 0.0
+        if mom_30s * mom_180s < 0:
+            return 0.5, 0.0, mom_30s
 
-        # ── Fair value probability (linear + OFI) ───────────────────────────
-        # 1% momentum in 30s → ~2.8% probability shift
         raw_prob = 0.5 + (mom_30s * 0.028) + (mom_180s * 0.012)
-
         if ofi > 0.57:
             raw_prob += 0.04
         elif ofi < 0.43:
             raw_prob -= 0.04
 
-        raw_prob  = max(0.10, min(0.90, raw_prob))
+        raw_prob   = max(0.10, min(0.90, raw_prob))
         fair_value = raw_prob if direction == "UP" else (1.0 - raw_prob)
 
-        # ── Confidence ───────────────────────────────────────────────────────
-        # Based on: momentum magnitude, OFI strength, history depth
-        mom_conf   = min(abs(mom_30s) / 0.8, 1.0) * 45    # up to 45 pts
-        ofi_conf   = 25 if abs(ofi - 0.5) > 0.10 else 10   # up to 25 pts
-        depth_conf = min(len(hist) / 60, 1.0) * 30          # up to 30 pts (1 min warmup)
+        mom_conf   = min(abs(mom_30s) / 0.8, 1.0) * 45
+        ofi_conf   = 25 if abs(ofi - 0.5) > 0.10 else 10
+        depth_conf = min(len(hist) / 60, 1.0) * 30
         confidence = min(mom_conf + ofi_conf + depth_conf, 100.0)
 
-        return fair_value, confidence
+        return fair_value, confidence, mom_30s
 
     def evaluate(self, snap: MarketSnapshot) -> Optional[TradeSignal]:
-        fair_value, confidence = self._compute_fair_value(
+        self._log_filter_stats()
+
+        # ── Filter 1: Direction filter ──────────────────────────────────────
+        # Only trade asset/direction combinations with proven edge in paper data.
+        # BTC_UP and ETH_DOWN showed 54–62% win rate at realistic prices.
+        # BTC_DOWN and ETH_UP showed 41–43% — below fee-recovery threshold.
+        signal_key = f"{snap.asset}_{snap.direction}"
+        if CONFIG.allowed_signals and signal_key not in CONFIG.allowed_signals:
+            self._filter_counts["direction"] += 1
+            return None
+
+        fair_value, confidence, mom_30s = self._compute_fair_value(
             snap.asset, snap.direction, snap.duration
         )
 
+        # ── Filter 2: Minimum momentum ──────────────────────────────────────
+        # Low-momentum signals cluster near 49% win rate — essentially noise.
+        # Require at least 0.3% move in the last 30 seconds to proceed.
+        if abs(mom_30s) < CONFIG.min_momentum_pct:
+            self._filter_counts["momentum"] += 1
+            return None
+
+        # Timeframe conflict already handled in _compute_fair_value
+        # (returns confidence=0 when mom_30s * mom_180s < 0)
+        if confidence == 0.0:
+            self._filter_counts["timeframe"] += 1
+            return None
+
+        # ── Filter 3: Confidence threshold ─────────────────────────────────
         if confidence < CONFIG.confidence_threshold:
+            self._filter_counts["confidence"] += 1
             return None
 
         yes_edge = (fair_value - snap.yes_price) * 100
         no_edge  = ((1 - fair_value) - snap.no_price) * 100
 
-        # ── Lag check: Polymarket must actually be lagging CEX ───────────────
+        # ── Filter 4: Lag threshold (raised to 2.5%) ────────────────────────
+        # Clean data showed trades at 1.5–2.5% lag had ~49% win rate.
+        # Only trade when Polymarket genuinely lags CEX by 2.5%+.
         lag = abs(fair_value - snap.yes_price) * 100
         if lag < CONFIG.lag_threshold_pct:
+            self._filter_counts["lag"] += 1
             return None
 
+        # ── Filter 5: Edge threshold ────────────────────────────────────────
         if yes_edge >= CONFIG.min_edge_pct and yes_edge > no_edge:
             side, poly_price, edge_val = "YES", snap.yes_price, yes_edge
         elif no_edge >= CONFIG.min_edge_pct:
             side, poly_price, edge_val = "NO", snap.no_price, no_edge
         else:
+            self._filter_counts["edge"] += 1
             return None
 
-        log.debug("SIGNAL %s %s | Fair=%.4f Poly=%.4f | Edge=%+.2f%% Lag=%.2f%% Conf=%.1f%%",
+        log.debug("SIGNAL %s %s | Fair=%.4f Poly=%.4f | "
+                  "Edge=%+.2f%% Lag=%.2f%% Mom=%.3f%% Conf=%.1f%%",
                   snap.asset, snap.direction, fair_value, snap.yes_price,
-                  edge_val, lag, confidence)
+                  edge_val, lag, mom_30s, confidence)
 
         return TradeSignal(
             market_id=snap.market_id,
@@ -1659,35 +1720,30 @@ class OrderExecutor:
             )
         return self._client
 
-    def _limit_price(self, sig: TradeSignal, snap: MarketSnapshot) -> float:
+    def _limit_price(self, sig: TradeSignal, snap: MarketSnapshot) -> Optional[float]:
         """
-        Post limit slightly inside the spread from yes_price.
-
-        Problem with raw mid-price: when best_bid is stale or the book is thin,
-        mid can be far below yes_price (e.g. 0.16 on a 0.50 contract).
-        That price would never fill in real Polymarket — it just sits in the book.
-
-        Fix: start from yes_price (the WS best_bid_ask mid), then offer a small
-        discount of up to 1 tick (0.01) to improve fill probability while staying
-        realistic. Never more than 0.02 below yes_price.
+        Returns limit price anchored to yes_price, or None if the snapshot
+        looks stale (yes_price below 0.30 on a contract we expect near 0.50).
+        Returning None causes the trade to be skipped entirely.
         """
-        # yes_price from the snapshot is already (best_bid + best_ask) / 2
-        # from the WS best_bid_ask event — use it as the anchor
-        if snap.yes_price > 0:
-            anchor = snap.yes_price
-        elif snap.asks and snap.bids:
-            anchor = (snap.bids[0][0] + snap.asks[0][0]) / 2
-        else:
-            anchor = sig.poly_price
+        # Guard: if yes_price is suspiciously low the WS snapshot is stale
+        # or this is a near-resolved contract that slipped past our filters.
+        # Entering at 0.17 when fair value is 0.50 never fills in real life.
+        if snap.yes_price < 0.30 or snap.yes_price > 0.70:
+            log.debug("_limit_price: skipping stale/near-resolved snap "
+                      "%s yes_price=%.2f", snap.market_id[:12], snap.yes_price)
+            return None
 
-        # Offer 1 tick inside to improve fill rate without straying far from fair
+        # Anchor to yes_price (WS best_bid_ask mid) — not raw book mid
+        anchor = snap.yes_price
+
+        # Offer 1 tick inside to improve fill rate
         if sig.side == "YES":
-            price = anchor - 0.01          # bid 1 tick below yes mid
+            price = anchor - 0.01
         else:
-            price = (1.0 - anchor) - 0.01  # bid 1 tick below no mid
+            price = (1.0 - anchor) - 0.01
 
-        # Hard clamp: never more than 0.02 below the anchor price.
-        # This prevents stale/thin books from producing 0.16 entries on 0.50 contracts.
+        # Hard clamp: never more than 0.02 below anchor
         min_price = (anchor - 0.02) if sig.side == "YES" else ((1.0 - anchor) - 0.02)
         price = max(price, min_price, 0.01)
 
@@ -1720,6 +1776,11 @@ class OrderExecutor:
 
         trade_id    = f"{sig.market_id}-{int(time.time()*1000)}"
         limit_price = self._limit_price(sig, snap) if snap else round(sig.poly_price, 2)
+
+        # Skip if _limit_price flagged the snapshot as stale
+        if limit_price is None:
+            log.debug("execute: skipping — stale snapshot price")
+            return None
 
         # ── Paper mode ──────────────────────────────────────────────────────
         if not self.live:
